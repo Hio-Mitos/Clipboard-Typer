@@ -42,6 +42,7 @@ import win32api
 import pystray
 from PIL import Image, ImageDraw
 import tkinter as tk
+from tkinter import ttk
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -390,17 +391,41 @@ def quick_type_latest():
 # History manager popup (Win+Alt+V)
 #
 # Styled and behaved like a lightweight flyout (similar spirit to the native
-# Win+V panel): no title bar, appears next to the mouse/caret, single click
-# (or Enter) commits the item immediately, and it closes itself the instant
-# it loses focus so it never lingers on screen.
+# Win+V panel): no title bar, rounded corners, appears next to the
+# mouse/caret, single click (or Enter) commits the item immediately, and it
+# closes itself the instant it loses focus so it never lingers on screen.
 # ---------------------------------------------------------------------------
-POPUP_WIDTH = 360
-POPUP_MAX_HEIGHT = 420
-ROW_HEIGHT = 26
-BORDER_COLOR = "#0078D4"   # Windows accent blue, for a native-ish flyout border
+POPUP_WIDTH = 380
+POPUP_MAX_HEIGHT = 460
+ROW_HEIGHT = 40
+HEADER_HEIGHT = 40
+FOOTER_HEIGHT = 34
+CORNER_RADIUS = 12
+
+ACCENT = "#2F6FED"          # modern blue accent (header icon, selection, top strip)
+BORDER_COLOR = "#E3E6EC"    # soft neutral frame around the whole flyout
 BG_COLOR = "#FFFFFF"
-SELECT_COLOR = "#CCE4F7"
-HINT_COLOR = "#6B6B6B"
+HEADER_BG = "#F7F9FC"
+TEXT_PRIMARY = "#1F2430"
+TEXT_SECONDARY = "#8890A0"
+ROW_HOVER = "#F3F6FD"
+ROW_SELECTED = "#E8EFFE"
+CHIP_BG = "#EEF1F6"
+CHIP_FG = "#5B6472"
+SCROLLBAR_THUMB = "#D2D6DE"
+
+
+def _apply_rounded_corners(root, width, height, radius=CORNER_RADIUS):
+    """Clip the (overrideredirect) window to a rounded rectangle so it reads
+    as a modern flyout instead of a hard-edged box. Works the same way on
+    Windows 7 through 11, since it doesn't depend on DWM auto-rounding
+    (which only some Windows 11 top-level windows get for free)."""
+    try:
+        hwnd = int(root.winfo_id())
+        region = win32gui.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius)
+        win32gui.SetWindowRgn(hwnd, region, True)
+    except Exception:
+        pass
 
 
 def open_manager():
@@ -417,69 +442,260 @@ def open_manager():
             items = list(history)
 
         root = tk.Tk()
-        root.withdraw()  # position it before showing, to avoid a visible jump
-        root.overrideredirect(True)   # no title bar / borders -> flyout look
+        root.withdraw()  # position/size it before showing, to avoid a visible jump
+        root.overrideredirect(True)   # no title bar / native borders -> flyout look
         root.attributes("-topmost", True)
         try:
-            root.attributes("-alpha", 0.98)
+            root.attributes("-alpha", 0.99)
         except tk.TclError:
             pass
         root.configure(bg=BORDER_COLOR)
 
-        outer = tk.Frame(root, bg=BORDER_COLOR)
-        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        style = ttk.Style(root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "Flyout.Vertical.TScrollbar",
+            background=SCROLLBAR_THUMB,
+            troughcolor=BG_COLOR,
+            bordercolor=BG_COLOR,
+            lightcolor=SCROLLBAR_THUMB,
+            darkcolor=SCROLLBAR_THUMB,
+            arrowsize=0,
+            gripcount=0,
+            width=7,
+        )
 
-        inner = tk.Frame(outer, bg=BG_COLOR)
-        inner.pack(fill=tk.BOTH, expand=True)
+        # 1px soft border, then the actual card content on top
+        card = tk.Frame(root, bg=BG_COLOR)
+        card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-        hint = tk.Label(
-            inner,
-            text="Click / Enter = type it   ·   Ctrl+click / Ctrl+Enter = paste directly   ·   Esc = close",
-            fg=HINT_COLOR,
-            bg=BG_COLOR,
-            anchor="w",
-            justify="left",
+        # thin accent strip along the top edge
+        tk.Frame(card, bg=ACCENT, height=3).pack(fill=tk.X, side=tk.TOP)
+
+        # --- header: icon + title + item count ---------------------------
+        header = tk.Frame(card, bg=HEADER_BG)
+        header.pack(fill=tk.X, side=tk.TOP)
+
+        header_inner = tk.Frame(header, bg=HEADER_BG)
+        header_inner.pack(fill=tk.X, padx=12, pady=8)
+
+        icon_canvas = tk.Canvas(
+            header_inner, width=16, height=16, bg=HEADER_BG, highlightthickness=0
+        )
+        icon_canvas.pack(side=tk.LEFT, padx=(0, 8))
+        icon_canvas.create_rectangle(2, 1, 14, 15, outline=ACCENT, width=2, fill=BG_COLOR)
+        icon_canvas.create_rectangle(5, 0, 11, 3, outline=ACCENT, width=1, fill=ACCENT)
+        icon_canvas.create_line(4, 6, 12, 6, fill=ACCENT, width=1)
+        icon_canvas.create_line(4, 9, 12, 9, fill=ACCENT, width=1)
+        icon_canvas.create_line(4, 12, 9, 12, fill=ACCENT, width=1)
+
+        tk.Label(
+            header_inner,
+            text="Clipboard History",
+            bg=HEADER_BG,
+            fg=TEXT_PRIMARY,
+            font=("Segoe UI Semibold", 10),
+        ).pack(side=tk.LEFT)
+
+        count_text = f"{len(items)} item" + ("" if len(items) == 1 else "s")
+        tk.Label(
+            header_inner,
+            text=count_text,
+            bg=HEADER_BG,
+            fg=TEXT_SECONDARY,
             font=("Segoe UI", 8),
-            wraplength=POPUP_WIDTH - 20,
+        ).pack(side=tk.RIGHT)
+
+        tk.Frame(card, bg=BORDER_COLOR, height=1).pack(fill=tk.X, side=tk.TOP)
+
+        # --- scrollable row list -------------------------------------------
+        list_area = tk.Frame(card, bg=BG_COLOR)
+        list_area.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+
+        canvas = tk.Canvas(list_area, bg=BG_COLOR, highlightthickness=0)
+        vscroll = ttk.Scrollbar(
+            list_area, orient="vertical", command=canvas.yview, style="Flyout.Vertical.TScrollbar"
         )
-        hint.pack(fill=tk.X, padx=10, pady=(8, 4))
+        scroll_frame = tk.Frame(canvas, bg=BG_COLOR)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        list_frame = tk.Frame(inner, bg=BG_COLOR)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        listbox = tk.Listbox(
-            list_frame,
-            font=("Segoe UI", 10),
-            yscrollcommand=scrollbar.set,
-            activestyle="none",
-            highlightthickness=0,
-            borderwidth=0,
-            bg=BG_COLOR,
-            selectbackground=SELECT_COLOR,
-            selectforeground="#000000",
+        scroll_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=listbox.yview)
+        canvas.bind(
+            "<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width)
+        )
+
+        def _on_wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        state = {"index": 0, "rows": []}
+
+        def _highlight():
+            for i, row in enumerate(state["rows"]):
+                selected = i == state["index"]
+                bg = ROW_SELECTED if selected else BG_COLOR
+                row.configure(bg=bg)
+                row.accent_bar.configure(bg=ACCENT if selected else BG_COLOR)
+                row.text_label.configure(bg=bg)
+                row.meta_label.configure(bg=bg)
+
+        def _ensure_visible(row):
+            canvas.update_idletasks()
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            total_h = max(bbox[3], 1)
+            view_h = canvas.winfo_height()
+            top = row.winfo_y()
+            bottom = top + row.winfo_height()
+            first, last = canvas.yview()
+            visible_top = first * total_h
+            visible_bottom = last * total_h
+            if top < visible_top:
+                canvas.yview_moveto(top / total_h)
+            elif bottom > visible_bottom:
+                canvas.yview_moveto((bottom - view_h) / total_h)
+
+        def set_selection(index):
+            if not state["rows"]:
+                return
+            index = max(0, min(index, len(state["rows"]) - 1))
+            state["index"] = index
+            _highlight()
+            _ensure_visible(state["rows"][index])
+
+        def act(type_as_keystrokes):
+            if not items or not state["rows"]:
+                close()
+                return
+            text = items[state["index"]]
+            close()
+            if type_as_keystrokes:
+                threading.Thread(target=_type_into, args=(origin_hwnd, text), daemon=True).start()
+            else:
+                threading.Thread(target=_paste_directly, args=(origin_hwnd, text), daemon=True).start()
+
+        def build_row(entry, index):
+            row = tk.Frame(scroll_frame, bg=BG_COLOR, height=ROW_HEIGHT)
+            row.pack(fill=tk.X, side=tk.TOP)
+            row.pack_propagate(False)
+
+            accent_bar = tk.Frame(row, bg=BG_COLOR, width=3)
+            accent_bar.pack(side=tk.LEFT, fill=tk.Y)
+
+            text_body = tk.Frame(row, bg=BG_COLOR)
+            text_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 6), pady=4)
+
+            single_line = entry.replace("\n", "  ").replace("\t", "  ")
+            preview = single_line if len(single_line) <= 58 else single_line[:58] + "..."
+            text_label = tk.Label(
+                text_body,
+                text=preview,
+                bg=BG_COLOR,
+                fg=TEXT_PRIMARY,
+                font=("Segoe UI", 10),
+                anchor="w",
+                justify="left",
+            )
+            text_label.pack(fill=tk.X, anchor="w")
+
+            line_count = entry.count("\n") + 1
+            meta_bits = [f"{len(entry)} chars"]
+            if line_count > 1:
+                meta_bits.append(f"{line_count} lines")
+            meta_label = tk.Label(
+                text_body,
+                text="  ·  ".join(meta_bits),
+                bg=BG_COLOR,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 8),
+                anchor="w",
+            )
+            meta_label.pack(fill=tk.X, anchor="w")
+
+            row.accent_bar = accent_bar
+            row.text_label = text_label
+            row.meta_label = meta_label
+
+            def on_enter(_e, i=index):
+                if i != state["index"]:
+                    row.configure(bg=ROW_HOVER)
+                    text_label.configure(bg=ROW_HOVER)
+                    meta_label.configure(bg=ROW_HOVER)
+
+            def on_leave(_e, i=index):
+                if i != state["index"]:
+                    row.configure(bg=BG_COLOR)
+                    text_label.configure(bg=BG_COLOR)
+                    meta_label.configure(bg=BG_COLOR)
+
+            def on_press(_e, i=index):
+                set_selection(i)
+
+            def on_release(_e, i=index):
+                ctrl_held = bool(_e.state & 0x0004)
+                set_selection(i)
+                root.after(1, lambda: act(not ctrl_held))
+
+            for widget in (row, text_body, text_label, meta_label):
+                widget.bind("<Enter>", on_enter)
+                widget.bind("<Leave>", on_leave)
+                widget.bind("<ButtonPress-1>", on_press)
+                widget.bind("<ButtonRelease-1>", on_release)
+
+            return row
 
         if not items:
-            listbox.insert(tk.END, "(clipboard history is empty)")
+            empty = tk.Frame(scroll_frame, bg=BG_COLOR, height=ROW_HEIGHT * 2)
+            empty.pack(fill=tk.X)
+            empty.pack_propagate(False)
+            tk.Label(
+                empty,
+                text="Clipboard history is empty",
+                bg=BG_COLOR,
+                fg=TEXT_SECONDARY,
+                font=("Segoe UI", 9),
+            ).pack(expand=True)
         else:
-            for entry in items:
-                preview = entry.replace("\n", " ⏎ ").replace("\t", "→")
-                if len(preview) > 120:
-                    preview = preview[:120] + "..."
-                listbox.insert(tk.END, preview)
+            for idx, entry in enumerate(items):
+                state["rows"].append(build_row(entry, idx))
+            set_selection(0)
 
-        listbox.selection_set(0)
-        listbox.activate(0)
+        # --- footer: key hints as small chips -------------------------------
+        tk.Frame(card, bg=BORDER_COLOR, height=1).pack(fill=tk.X, side=tk.TOP)
+        footer = tk.Frame(card, bg=HEADER_BG)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        footer_inner = tk.Frame(footer, bg=HEADER_BG)
+        footer_inner.pack(padx=10, pady=6)
+
+        def chip(parent, key, label):
+            group = tk.Frame(parent, bg=HEADER_BG)
+            group.pack(side=tk.LEFT, padx=(0, 12))
+            tk.Label(
+                group, text=key, bg=CHIP_BG, fg=CHIP_FG, font=("Segoe UI", 7, "bold"), padx=5, pady=1
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                group, text=" " + label, bg=HEADER_BG, fg=TEXT_SECONDARY, font=("Segoe UI", 8)
+            ).pack(side=tk.LEFT)
+
+        chip(footer_inner, "Enter", "Type")
+        chip(footer_inner, "Ctrl+Enter", "Paste")
+        chip(footer_inner, "Esc", "Close")
 
         # --- size + position: appears right next to the mouse cursor,
         # clamped so it never runs off the edge of the screen ---
-        visible_rows = min(max(len(items), 1), 10)
-        height = 40 + visible_rows * ROW_HEIGHT
+        visible_rows = min(max(len(items), 1), 8)
+        content_height = max(visible_rows * ROW_HEIGHT, ROW_HEIGHT * 2)
+        height = HEADER_HEIGHT + content_height + FOOTER_HEIGHT + 4
         height = min(height, POPUP_MAX_HEIGHT)
 
         cursor_x, cursor_y = win32api.GetCursorPos()
@@ -499,31 +715,16 @@ def open_manager():
             closed["done"] = True
             global _manager_open
             _manager_open = False
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
             root.destroy()
 
-        def act(type_as_keystrokes):
-            sel = listbox.curselection()
-            if not sel or not items:
-                close()
-                return
-            text = items[sel[0]]
-            close()
-            if type_as_keystrokes:
-                threading.Thread(target=_type_into, args=(origin_hwnd, text), daemon=True).start()
-            else:
-                threading.Thread(target=_paste_directly, args=(origin_hwnd, text), daemon=True).start()
-
-        def on_click(event):
-            # let the click set the selection first, then commit on release
-            index = listbox.nearest(event.y)
-            listbox.selection_clear(0, tk.END)
-            listbox.selection_set(index)
-            ctrl_held = bool(event.state & 0x0004)
-            root.after(1, lambda: act(not ctrl_held))
-
-        listbox.bind("<ButtonRelease-1>", on_click)
-        listbox.bind("<Return>", lambda e: act(True))
-        listbox.bind("<Control-Return>", lambda e: act(False))
+        root.bind("<Up>", lambda e: set_selection(state["index"] - 1))
+        root.bind("<Down>", lambda e: set_selection(state["index"] + 1))
+        root.bind("<Return>", lambda e: act(True))
+        root.bind("<Control-Return>", lambda e: act(False))
         root.bind("<Escape>", close)
         # Auto-close as soon as the flyout loses focus, just like a native
         # popup (e.g. user clicks elsewhere or alt-tabs away).
@@ -539,8 +740,9 @@ def open_manager():
         root.protocol("WM_DELETE_WINDOW", close)
 
         root.deiconify()
+        _apply_rounded_corners(root, POPUP_WIDTH, height)
         root.lift()
-        root.after(10, lambda: (root.focus_force(), listbox.focus_set()))
+        root.after(10, lambda: root.focus_force())
 
         root.mainloop()
 
