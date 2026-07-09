@@ -29,8 +29,10 @@ Run:
 """
 
 import ctypes
+import sys
 import threading
 import time
+import traceback
 from collections import deque
 
 import keyboard
@@ -47,6 +49,7 @@ from tkinter import ttk
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+APP_TITLE = "Clipboard Typer"
 HISTORY_MAXLEN = 50              # keep last 50 copied text items, in memory only
 POLL_INTERVAL = 0.4              # seconds between clipboard checks
 MANAGER_HOTKEY = "windows+alt+v"
@@ -56,6 +59,7 @@ KEY_PRESS_GAP = 0.004             # delay between a key's down and its up event
 NEWLINE_DELAY = 0.022
 BREATHER_EVERY = 40               # extra pause every N characters, lets the
 BREATHER_DELAY = 0.05             # target app's input queue catch its breath
+MANAGER_INACTIVITY_MS = 20_000    # auto-close the history flyout after this much idle time
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -67,6 +71,67 @@ monitoring_enabled = True
 _manager_open = False
 _hotkey_refs = {}
 _hotkey_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Crash reporting
+#
+# This app has no console window (run via pythonw.exe), so an unhandled
+# exception would normally just kill a thread - or the whole process -
+# completely silently: the tray icon would vanish and the user would have
+# no idea why. These hooks make sure any crash that isn't the user choosing
+# to Quit pops up a plain Windows message box explaining what happened.
+# ---------------------------------------------------------------------------
+def _show_error_box(title, message):
+    try:
+        # MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x00000010 | 0x00040000 | 0x00010000)
+    except Exception:
+        pass
+
+
+def _format_exc(exc_type, exc_value, exc_tb, limit_chars=1200):
+    text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    if len(text) > limit_chars:
+        text = "...\n" + text[-limit_chars:]
+    return text
+
+
+def _thread_crash_handler(args):
+    """Installed as threading.excepthook: catches crashes in any background
+    thread (clipboard monitor, typing bursts, the hotkey listener, ...)."""
+    details = _format_exc(args.exc_type, args.exc_value, args.exc_traceback)
+    _show_error_box(
+        f"{APP_TITLE} - background task crashed",
+        "A background task in Clipboard Typer stopped unexpectedly because of "
+        "an internal error (not something you did).\n\n"
+        f"Task: {args.thread.name}\n"
+        "The app is still running, but this feature may not work until you "
+        "restart Clipboard Typer.\n\n"
+        f"Details:\n{details}",
+    )
+
+
+def _main_crash_handler(exc_type, exc_value, exc_tb):
+    """Installed as sys.excepthook: catches any crash that escapes main()
+    itself (main thread), e.g. a bug during startup or in the tray icon's
+    own event loop."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    details = _format_exc(exc_type, exc_value, exc_tb)
+    _show_error_box(
+        f"{APP_TITLE} - stopped unexpectedly",
+        "Clipboard Typer has crashed and is no longer running in the "
+        "background, because of an internal error - not something you did.\n\n"
+        "You'll need to start it again (from its shortcut, or by re-running "
+        "clipboard_typer.py) to get the shortcuts working again.\n\n"
+        f"Details:\n{details}",
+    )
+
+
+threading.excepthook = _thread_crash_handler
+sys.excepthook = _main_crash_handler
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +507,18 @@ def open_manager():
             items = list(history)
 
         root = tk.Tk()
+
+        def _tk_callback_exception(exc_type, exc_value, exc_tb):
+            # Errors inside Tk event callbacks (a click handler, a key
+            # binding, ...) don't normally propagate anywhere - Tkinter just
+            # prints them to stderr, which is invisible with no console.
+            # Route them through the same crash notification instead.
+            _thread_crash_handler(
+                threading.ExceptHookArgs(exc_type, exc_value, exc_tb, threading.current_thread())
+            )
+
+        root.report_callback_exception = _tk_callback_exception
+
         root.withdraw()  # position/size it before showing, to avoid a visible jump
         root.overrideredirect(True)   # no title bar / native borders -> flyout look
         root.attributes("-topmost", True)
@@ -473,13 +550,16 @@ def open_manager():
         card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
         # thin accent strip along the top edge
-        tk.Frame(card, bg=ACCENT, height=3).pack(fill=tk.X, side=tk.TOP)
+        top_strip = tk.Frame(card, bg=ACCENT, height=3)
+        top_strip.pack(fill=tk.X, side=tk.TOP)
 
         # --- header: icon + title + item count ---------------------------
-        header = tk.Frame(card, bg=HEADER_BG)
+        # Also doubles as the drag handle, since overrideredirect windows
+        # have no title bar to grab - see the drag bindings just below.
+        header = tk.Frame(card, bg=HEADER_BG, cursor="fleur")
         header.pack(fill=tk.X, side=tk.TOP)
 
-        header_inner = tk.Frame(header, bg=HEADER_BG)
+        header_inner = tk.Frame(header, bg=HEADER_BG, cursor="fleur")
         header_inner.pack(fill=tk.X, padx=12, pady=8)
 
         icon_canvas = tk.Canvas(
@@ -492,22 +572,42 @@ def open_manager():
         icon_canvas.create_line(4, 9, 12, 9, fill=ACCENT, width=1)
         icon_canvas.create_line(4, 12, 9, 12, fill=ACCENT, width=1)
 
-        tk.Label(
+        title_label = tk.Label(
             header_inner,
             text="Clipboard History",
             bg=HEADER_BG,
             fg=TEXT_PRIMARY,
             font=("Segoe UI Semibold", 10),
-        ).pack(side=tk.LEFT)
+            cursor="fleur",
+        )
+        title_label.pack(side=tk.LEFT)
 
         count_text = f"{len(items)} item" + ("" if len(items) == 1 else "s")
-        tk.Label(
+        count_label = tk.Label(
             header_inner,
             text=count_text,
             bg=HEADER_BG,
             fg=TEXT_SECONDARY,
             font=("Segoe UI", 8),
-        ).pack(side=tk.RIGHT)
+            cursor="fleur",
+        )
+        count_label.pack(side=tk.RIGHT)
+
+        # --- drag-to-move: the header area (and the accent strip above it)
+        # act as the title bar this overrideredirect window doesn't have.
+        _drag = {"x": 0, "y": 0}
+
+        def _drag_start(event):
+            _drag["x"] = event.x_root - root.winfo_x()
+            _drag["y"] = event.y_root - root.winfo_y()
+
+        def _drag_move(event):
+            root.geometry(f"+{event.x_root - _drag['x']}+{event.y_root - _drag['y']}")
+            _reset_inactivity_timer()
+
+        for widget in (top_strip, header, header_inner, title_label, count_label):
+            widget.bind("<ButtonPress-1>", _drag_start)
+            widget.bind("<B1-Motion>", _drag_move)
 
         tk.Frame(card, bg=BORDER_COLOR, height=1).pack(fill=tk.X, side=tk.TOP)
 
@@ -708,6 +808,7 @@ def open_manager():
         root.geometry(f"{POPUP_WIDTH}x{height}+{x}+{y}")
 
         closed = {"done": False}
+        inactivity = {"job": None}
 
         def close(event=None):
             if closed["done"]:
@@ -715,11 +816,27 @@ def open_manager():
             closed["done"] = True
             global _manager_open
             _manager_open = False
+            if inactivity["job"] is not None:
+                try:
+                    root.after_cancel(inactivity["job"])
+                except Exception:
+                    pass
             try:
                 canvas.unbind_all("<MouseWheel>")
             except Exception:
                 pass
             root.destroy()
+
+        def _reset_inactivity_timer(event=None):
+            # Closing here only ever destroys this popup window - the
+            # clipboard monitor, hotkeys, and tray icon all keep running in
+            # the background regardless of whether this window is open.
+            if inactivity["job"] is not None:
+                try:
+                    root.after_cancel(inactivity["job"])
+                except Exception:
+                    pass
+            inactivity["job"] = root.after(MANAGER_INACTIVITY_MS, close)
 
         root.bind("<Up>", lambda e: set_selection(state["index"] - 1))
         root.bind("<Down>", lambda e: set_selection(state["index"] + 1))
@@ -729,6 +846,13 @@ def open_manager():
         # Auto-close as soon as the flyout loses focus, just like a native
         # popup (e.g. user clicks elsewhere or alt-tabs away).
         root.bind("<FocusOut>", lambda e: root.after(120, _close_if_unfocused))
+
+        # Any mouse movement, click, key press, or scroll inside the window
+        # counts as activity and pushes the 20s auto-close timer back out.
+        root.bind_all("<Motion>", _reset_inactivity_timer)
+        root.bind_all("<Button>", _reset_inactivity_timer)
+        root.bind_all("<Key>", _reset_inactivity_timer)
+        root.bind_all("<MouseWheel>", _reset_inactivity_timer, add="+")
 
         def _close_if_unfocused():
             try:
@@ -743,6 +867,7 @@ def open_manager():
         _apply_rounded_corners(root, POPUP_WIDTH, height)
         root.lift()
         root.after(10, lambda: root.focus_force())
+        _reset_inactivity_timer()
 
         root.mainloop()
 
@@ -806,7 +931,7 @@ def run_tray():
 def main():
     _enable_dpi_awareness()
 
-    threading.Thread(target=monitor_clipboard, daemon=True).start()
+    threading.Thread(target=monitor_clipboard, daemon=True, name="ClipboardMonitor").start()
 
     _register_hotkeys()
 

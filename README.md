@@ -13,10 +13,12 @@ native Windows+V clipboard history.
 | `Ctrl + Alt + V` | Instantly types out the most recently copied text, with no window shown. |
 
 The history flyout is built to feel like the native Windows+V panel:
-- It pops up beside your cursor (not in a fixed corner), borderless, with a thin accent border.
+- It pops up beside your cursor (not in a fixed corner), with a rounded border and a header/footer bar.
 - **Click an item, or press Enter** on the highlighted one, and it's typed out immediately wherever your cursor/focus was (a text box, chat window, etc.) — the flyout closes itself the instant you act.
 - **Ctrl+click, or Ctrl+Enter**, pastes it directly instead (normal clipboard paste).
-- Clicking away, alt-tabbing, or pressing **Esc** closes it instantly — it never lingers on screen.
+- **Drag the header bar** (or the thin accent strip above it) to move the window anywhere on screen.
+- Clicking away, alt-tabbing, or pressing **Esc** closes it instantly.
+- If you leave it open and don't touch it, it **auto-closes after 20 seconds of inactivity** (any click, keypress, drag, or mouse movement over the window resets that timer). Closing the flyout — whether you close it yourself or it times out — never stops the background app: clipboard monitoring, both hotkeys, and the tray icon keep running exactly as before.
 
 While typing, every line break in the original text is sent as
 `Shift+Enter` instead of `Enter`, and spacing/tabs/indentation are kept
@@ -101,3 +103,21 @@ shortcut at that instead, so Python doesn't need to be installed.
   (caused by the hotkey listener and the typing loop fighting over the same
   stream of synthetic keystrokes). If you ever see garbled output again on a
   very slow app, try raising `CHAR_DELAY` / `BREATHER_DELAY` a bit.
+- The flyout's auto-close time (default 20s) is `MANAGER_INACTIVITY_MS` at
+  the top of `clipboard_typer.py`.
+
+## If something crashes
+
+The app has no console window, so by default a bug would just silently kill
+a thread — or the whole app — with no explanation. To avoid that, any crash
+that isn't you choosing **Quit** from the tray icon pops up a Windows message
+box telling you what happened:
+- A crash in a background task (clipboard monitoring, a typing burst, the
+  hotkey listener, the history window) shows a box saying the app is *still
+  running* but that one feature may be degraded until you restart it.
+- A crash that takes down the whole app (e.g. during startup, or in the tray
+  icon's own loop) shows a box saying the app *has stopped* and needs to be
+  started again.
+
+Either way, the message box includes the underlying error so it can be
+reported/debugged.
