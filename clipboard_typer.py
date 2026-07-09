@@ -121,7 +121,13 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
 VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12       # Alt
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
 VK_RETURN = 0x0D
+
+MODIFIER_SETTLE_DELAY = 0.06   # time to let real key-ups catch up before typing
 
 _extra = ctypes.c_ulong(0)
 
@@ -210,6 +216,28 @@ def _send_shift_enter():
     time.sleep(NEWLINE_DELAY)
 
 
+def _release_modifiers():
+    """Force Ctrl/Alt/Shift/Win to a released state before we start typing.
+
+    Ctrl+Alt+V fires on the key-down of 'V' - at that instant the user is
+    usually still physically holding Ctrl and Alt down for a moment. If we
+    start sending Unicode characters while Windows still sees Ctrl/Alt as
+    held, some apps read the first few keystrokes as Ctrl+<char> / Alt+<char>
+    shortcuts instead of plain text, which is what causes the occasional
+    dropped/altered character right at the start of a Ctrl+Alt+V paste (this
+    doesn't happen from the history manager, since by the time you click an
+    item there, the hotkey's keys were already released).
+    """
+    _send(
+        _vk_event(VK_SHIFT, keyup=True),
+        _vk_event(VK_CONTROL, keyup=True),
+        _vk_event(VK_MENU, keyup=True),
+        _vk_event(VK_LWIN, keyup=True),
+        _vk_event(VK_RWIN, keyup=True),
+    )
+    time.sleep(MODIFIER_SETTLE_DELAY)
+
+
 def type_text(text):
     """Simulate typing `text` keystroke by keystroke.
     Every line break becomes Shift+Enter instead of Enter."""
@@ -226,6 +254,7 @@ def type_text(text):
     # typing burst removes that contention entirely.
     _unregister_hotkeys()
     try:
+        _release_modifiers()
         char_count = 0
         for i, line in enumerate(lines):
             for ch in line:
