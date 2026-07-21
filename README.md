@@ -121,3 +121,32 @@ box telling you what happened:
 
 Either way, the message box includes the underlying error so it can be
 reported/debugged.
+
+## Using it across a Remote Desktop / Windows App session
+
+Typing now works when the target text box is inside a remote session
+(Windows App, Remote Desktop / mstsc, Azure Virtual Desktop, Citrix-style
+tools), not just on the local PC. The typing engine sends a real virtual-key
+press for each character whenever the active keyboard layout supports it —
+that's the same kind of event a physical keyboard produces, which is what
+remote sessions forward over their keyboard channel. It only falls back to
+raw Unicode injection for characters the current layout can't produce (most
+emoji, non-Latin scripts) — that fallback is local-only and won't reach a
+remote session.
+
+A couple of things worth knowing when working across a remote session:
+- **Ctrl+Alt+V** doesn't involve the Windows key, so it reliably triggers
+  locally regardless of remote session settings.
+- **Win+Alt+V** can be affected by the remote client's "Windows key
+  combinations" setting — if that's set to send them to the remote computer
+  instead of keeping them local, the manager may not open. If that happens,
+  either switch that setting to "on this computer" (or "full screen only"),
+  or just use Ctrl+Alt+V instead.
+- If a paste still comes out slightly off on a high-latency connection, try
+  raising `CHAR_DELAY` at the top of `clipboard_typer.py` — remote sessions
+  have more delay between a keystroke being sent and the app on the other
+  end actually processing it than a local app does.
+- If the destination field there allows normal pasting (rather than
+  blocking Ctrl+V), **Ctrl+Enter / Ctrl+click ("paste directly")** is
+  simpler and relies on Remote Desktop's built-in clipboard redirection
+  instead of simulated keystrokes at all.

@@ -16,6 +16,10 @@ Background Windows utility that:
 When "typing", every line break in the copied text is sent as
 Shift+Enter (instead of Enter), and the rest of the formatting
 (spaces, tabs, indentation, unicode characters) is preserved exactly.
+Each character is sent as a real virtual-key press whenever the active
+keyboard layout supports it (falling back to Unicode injection only when it
+doesn't), so typing also works into a Remote Desktop / Windows App session,
+not just locally - see the README for details and caveats.
 
 Compatible with Windows 7, 8, 8.1, 10, 11 and later (see README for the
 Python version to use on each).
@@ -139,8 +143,11 @@ sys.excepthook = _main_crash_handler
 #
 # We build raw Windows SendInput events ourselves instead of relying on a
 # library's text-typing helper, because:
-#   - KEYEVENTF_UNICODE lets us send the *exact* character (spaces, tabs,
-#     accents, emoji, etc.) regardless of keyboard layout.
+#   - We can map characters to real virtual-key presses when possible (see
+#     _char_to_vk below), which is what remote sessions actually forward.
+#   - KEYEVENTF_UNICODE lets us send the *exact* character (accents, emoji,
+#     non-Latin scripts, ...) regardless of keyboard layout, as a fallback
+#     for characters that aren't reachable via the current layout.
 #   - We need full control over when Shift+Enter is sent for line breaks.
 # ---------------------------------------------------------------------------
 PUL = ctypes.POINTER(ctypes.c_ulong)
@@ -192,6 +199,13 @@ VK_MENU = 0x12       # Alt
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 VK_RETURN = 0x0D
+
+# VkKeyScanW(ch) -> a real virtual-key + shift-state for the current
+# keyboard layout, when that character can be typed at all with the active
+# layout. Declaring argtypes/restype explicitly because ctypes would
+# otherwise treat the WCHAR parameter as a pointer, not a value.
+ctypes.windll.user32.VkKeyScanW.argtypes = [ctypes.c_wchar]
+ctypes.windll.user32.VkKeyScanW.restype = ctypes.c_short
 
 MODIFIER_SETTLE_DELAY = 0.06   # time to let real key-ups catch up before typing
 
@@ -257,6 +271,41 @@ def _utf16_units(ch):
     return (high, low)
 
 
+def _char_to_vk(ch):
+    """Map a character to (virtual_key, shift, ctrl, alt) on the active
+    keyboard layout, if it can be typed that way at all.
+
+    This matters for Remote Desktop / Windows App / VMs / Citrix-style
+    sessions: those forward *real* virtual-key presses (the same thing a
+    physical keyboard produces) over their keyboard channel, but they
+    generally don't forward KEYEVENTF_UNICODE synthetic characters at all,
+    since those have no underlying hardware scancode. A VK-based keystroke
+    behaves like real typing and crosses that boundary correctly; a
+    Unicode-injected one is a local-only trick that silently gets dropped
+    once you're inside a remote session.
+
+    Returns None if the character isn't reachable on the current layout
+    (most emoji, many non-Latin scripts) - those fall back to Unicode
+    injection, which still works for local typing, just not over RDP.
+
+    Tab is deliberately excluded even though VK_TAB exists: a *real* Tab
+    keypress moves focus to the next field in most apps, which would break
+    the paste rather than insert a tab character - it's always sent as a
+    plain Unicode character instead, same as before.
+    """
+    if ch == "\t":
+        return None
+    try:
+        res = ctypes.windll.user32.VkKeyScanW(ch)
+    except (TypeError, ValueError):
+        return None
+    if res == -1 or (res & 0xFF) == 0xFF:
+        return None
+    vk = res & 0xFF
+    mod = (res >> 8) & 0xFF
+    return vk, bool(mod & 1), bool(mod & 2), bool(mod & 4)  # vk, shift, ctrl, alt
+
+
 def _type_char(ch):
     # Down and up are sent as two separate, ordered SendInput calls with a
     # small real gap between them: a zero-duration keypress is what a lot of
@@ -265,10 +314,23 @@ def _type_char(ch):
     # This function returns only after both events for this character have
     # been handed to the OS input queue in order, so the caller never starts
     # the next character until this one is fully done.
-    for unit in _utf16_units(ch):
-        _send(_unicode_event(unit))
+    mapped = _char_to_vk(ch)
+    if mapped is not None:
+        vk, shift, ctrl, alt = mapped
+        mod_downs = []
+        mod_ups = []
+        for needed, vk_mod in ((shift, VK_SHIFT), (ctrl, VK_CONTROL), (alt, VK_MENU)):
+            if needed:
+                mod_downs.append(_vk_event(vk_mod))
+                mod_ups.insert(0, _vk_event(vk_mod, keyup=True))
+        _send(*mod_downs, _vk_event(vk))
         time.sleep(KEY_PRESS_GAP)
-        _send(_unicode_event(unit, keyup=True))
+        _send(_vk_event(vk, keyup=True), *mod_ups)
+    else:
+        for unit in _utf16_units(ch):
+            _send(_unicode_event(unit))
+            time.sleep(KEY_PRESS_GAP)
+            _send(_unicode_event(unit, keyup=True))
     time.sleep(CHAR_DELAY)
 
 
