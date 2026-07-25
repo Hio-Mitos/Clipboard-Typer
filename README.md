@@ -181,20 +181,31 @@ Windows 10/11 users, not a replacement.
 - `build_msix.ps1` — builds the EXE and packs the `.msix` (see below).
 - `../clipboard_typer.spec` — the PyInstaller build config it uses.
 
-### One-time setup in Partner Center
+### Local testing vs. the real Store submission
+
+`AppxManifest.xml` ships with a working local-test identity
+(`Name="ClipboardTyper.LocalTest"`, `Publisher="CN=ClipboardTyperLocalTest"`)
+instead of a placeholder that fails to build — that Publisher value
+deliberately matches the self-signed test certificate `build_msix.ps1
+-SignForTesting` creates, so you can build and sideload-install a real
+`.msix` on your own PC right away, before touching Partner Center at all.
+
+Before actually submitting to the Store, swap that identity for your real
+one:
 
 1. Create/sign in to your Partner Center developer account and reserve the
    app name under **App management > App identity**.
 2. That page shows the exact **Package/Identity/Name** and **Publisher**
-   (a `CN=...` string) values for *your* reservation — copy them into
-   `AppxManifest.xml`, replacing the two `REPLACE ME` placeholders. Also set
+   (a `CN=...` string) values for *your* reservation — replace the
+   `Name`/`Publisher` in `AppxManifest.xml` with those, and set
    `PublisherDisplayName` to your Partner Center publisher display name.
+   `build_msix.ps1` will warn you at build time if the manifest still has
+   the local-test identity in it.
 
 ### Building the package
 
-On a Windows machine with Python, this project's `requirements.txt`,
-`pyinstaller`, and the Windows SDK installed (the SDK ships makeappx.exe /
-signtool.exe — get it standalone or via Visual Studio):
+On a Windows machine with Python, this project's `requirements.txt`, and
+`pyinstaller` installed:
 
 ```powershell
 cd packaging
@@ -207,6 +218,18 @@ package version, and add `-SignForTesting` if you want to sideload-install
 it on your own PC first to confirm it works before submitting (see the
 script's own comments — the test certificate it creates is only for that
 local check, not for the Store submission itself).
+
+**About makeappx/signtool:** the script needs these two Windows SDK tools to
+actually build the `.msix`. It looks for them on your `PATH`, then in a
+normal Windows SDK install location, and if neither is found it
+automatically downloads the small (~15MB) `Microsoft.Windows.SDK.BuildTools`
+NuGet package into `packaging\.tools\` and uses that — no SDK installer, no
+admin rights, no reboot needed. If that download also fails (common on a
+locked-down corporate network that blocks `nuget.org`), install the Windows
+SDK manually instead: run the standalone installer from
+https://developer.microsoft.com/windows/downloads/windows-sdk/ and choose
+**Custom install → check only "MSIX Packaging Tools"** (you don't need the
+rest of the SDK).
 
 ### Submitting
 

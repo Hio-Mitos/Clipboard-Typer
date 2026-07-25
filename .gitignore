@@ -19,6 +19,7 @@ dist/
 # MSIX packaging build output (see packaging/build_msix.ps1)
 packaging/staging/
 packaging/out/
+packaging/.tools/
 packaging/*.pfx
 
 # Editor/IDE

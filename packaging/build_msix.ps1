@@ -12,12 +12,12 @@
     Prerequisites:
       - Python + this project's requirements.txt installed (pip install -r
         ..\requirements.txt), plus PyInstaller (pip install pyinstaller).
-      - Windows SDK installed (comes with Visual Studio, or standalone from
-        https://developer.microsoft.com/windows/downloads/windows-sdk/).
-        This script looks for makeappx.exe / signtool.exe under the usual
-        "Windows Kits\10\bin\<version>\x64" install location; if yours is
-        somewhere else, edit $sdkBinRoot below or make sure both tools are
-        already on your PATH.
+      - makeappx.exe / signtool.exe: the script looks for them on PATH, then
+        under a normal Windows SDK install location, and if neither is found
+        it auto-downloads the small Microsoft.Windows.SDK.BuildTools NuGet
+        package into packaging\.tools (no SDK installer needed). If that
+        download is blocked by your network, install the Windows SDK
+        manually and choose the "MSIX Packaging Tools" feature.
       - AppxManifest.xml's Name/Publisher fields filled in with the values
         Partner Center gives you after you reserve the app name (see
         README.md's MSIX/Store section).
@@ -89,12 +89,39 @@ if ($Version) {
 }
 
 $manifestContent = Get-Content $manifestDst -Raw
-if ($manifestContent -match 'REPLACE ME') {
-    Write-Warning "AppxManifest.xml still has 'REPLACE ME' placeholders (Name/Publisher/PublisherDisplayName)."
-    Write-Warning "Fill those in from Partner Center > App identity before submitting - the package will still build for local testing."
+if ($manifestContent -match 'ClipboardTyper\.LocalTest' -or $manifestContent -match 'CN=ClipboardTyperLocalTest') {
+    Write-Warning "AppxManifest.xml is still using the local-test Name/Publisher (ClipboardTyper.LocalTest / CN=ClipboardTyperLocalTest)."
+    Write-Warning "That's fine for -SignForTesting sideload testing, but swap in your real Partner Center Name/Publisher (App management > App identity) before submitting to the Store."
 }
 
 # --- 3. Locate makeappx.exe / signtool.exe ----------------------------------
+# Tries, in order: PATH, an existing Windows SDK install, then auto-downloads
+# the "Microsoft.Windows.SDK.BuildTools" NuGet package (the same tools, ~15MB,
+# no installer/reboot/admin rights needed) into packaging\.tools and caches
+# it there. If your network blocks nuget.org (common on locked-down corporate
+# machines), this fallback will fail cleanly and print the manual option.
+$toolsCacheDir = Join-Path $packagingDir ".tools"
+
+function Get-SdkBuildToolsFromNuGet {
+    $marker = Join-Path $toolsCacheDir ".extracted"
+    if (Test-Path $marker) { return $toolsCacheDir }
+
+    Write-Host "==> makeappx/signtool not found locally - fetching Microsoft.Windows.SDK.BuildTools from NuGet..."
+    New-Item -ItemType Directory -Path $toolsCacheDir -Force | Out-Null
+
+    $versionsUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.buildtools/index.json"
+    $latest = (Invoke-RestMethod -Uri $versionsUrl -UseBasicParsing).versions[-1]
+    Write-Host "==> Using Microsoft.Windows.SDK.BuildTools $latest"
+
+    $nupkgUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.buildtools/$latest/microsoft.windows.sdk.buildtools.$latest.nupkg"
+    $zipPath = Join-Path $toolsCacheDir "buildtools.zip"
+    Invoke-WebRequest -Uri $nupkgUrl -OutFile $zipPath -UseBasicParsing
+
+    Expand-Archive -Path $zipPath -DestinationPath $toolsCacheDir -Force
+    New-Item -ItemType File -Path $marker | Out-Null
+    return $toolsCacheDir
+}
+
 function Find-SdkTool($toolName) {
     $onPath = Get-Command $toolName -ErrorAction SilentlyContinue
     if ($onPath) { return $onPath.Source }
@@ -107,12 +134,24 @@ function Find-SdkTool($toolName) {
             Select-Object -First 1
         if ($found) { return $found.FullName }
     }
+
+    try {
+        $toolsDir = Get-SdkBuildToolsFromNuGet
+        $found = Get-ChildItem -Path $toolsDir -Recurse -Filter $toolName -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\" } |
+            Select-Object -First 1
+        if ($found) { return $found.FullName }
+    } catch {
+        Write-Warning "Could not auto-fetch build tools from NuGet (probably a network/proxy restriction): $_"
+    }
     return $null
 }
 
 $makeappx = Find-SdkTool "makeappx.exe"
 if (-not $makeappx) {
-    throw "makeappx.exe not found. Install the Windows SDK (https://developer.microsoft.com/windows/downloads/windows-sdk/) or add it to PATH."
+    throw "makeappx.exe not found, and the automatic NuGet fetch didn't work either. Manual fix: install the " +
+          "Windows SDK from https://developer.microsoft.com/windows/downloads/windows-sdk/ - a Custom install " +
+          "with just the 'MSIX Packaging Tools' feature checked is enough, you don't need the whole SDK."
 }
 Write-Host "==> Using makeappx: $makeappx"
 
@@ -137,21 +176,31 @@ if ($SignForTesting) {
     $pfxPath = Join-Path $packagingDir "ClipboardTyperLocalTest.pfx"
     $pfxPassword = "clipboardtyper"  # local test cert only - not used for the real Store submission
 
-    $existingCert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $certSubject }
-    if (-not $existingCert) {
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $certSubject } | Select-Object -First 1
+    if (-not $cert) {
         Write-Host "`n==> Creating local self-signed test certificate ($certSubject)..."
-        $existingCert = New-SelfSignedCertificate -Type Custom -Subject $certSubject `
+        # Basic Constraints must explicitly say "false" (Subject Type=End
+        # Entity) - an empty value here produces a malformed extension that
+        # Windows' chain engine silently rejects as an untrusted root, even
+        # after the cert is imported into Trusted Root/Trusted People. That
+        # was the actual cause of "certificate chain ... terminated in a
+        # root certificate which is not trusted" during Add-AppxPackage.
+        $cert = New-SelfSignedCertificate -Type Custom -Subject $certSubject `
             -KeyUsage DigitalSignature -FriendlyName "Clipboard Typer local test cert" `
             -CertStoreLocation "Cert:\CurrentUser\My" `
-            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}false")
         $securePwd = ConvertTo-SecureString -String $pfxPassword -Force -AsPlainText
-        Export-PfxCertificate -Cert $existingCert -FilePath $pfxPath -Password $securePwd | Out-Null
+        Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePwd | Out-Null
         Write-Host "==> IMPORTANT: install $pfxPath into 'Trusted People' (CurrentUser) to sideload without a security warning:"
         Write-Host "    Certutil -user -p $pfxPassword -importpfx $pfxPath TrustedPeople"
     }
 
-    Write-Host "`n==> Signing package with local test certificate..."
-    & $signtool sign /a /fd SHA256 /s My /n $certSubject $msixPath
+    # Match by thumbprint, not /n subject-name substring matching combined
+    # with /a (auto-select) - that combination is what failed with "No
+    # certificates were found that met all the given criteria" even though
+    # the certificate genuinely existed. Thumbprint is exact, no ambiguity.
+    Write-Host "`n==> Signing package with local test certificate (thumbprint $($cert.Thumbprint))..."
+    & $signtool sign /fd SHA256 /s My /sha1 $cert.Thumbprint $msixPath
     if ($LASTEXITCODE -ne 0) { throw "signtool failed (exit $LASTEXITCODE)." }
     Write-Host "==> Signed. You can now sideload-install this .msix for local testing (double-click it, or Add-AppxPackage)."
 } else {

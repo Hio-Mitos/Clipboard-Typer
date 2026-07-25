@@ -8,14 +8,24 @@
   system-wide keyboard hooks and SendInput, which the restricted UWP
   sandbox does not allow.
 
-  BEFORE BUILDING:
+  BEFORE SUBMITTING TO THE STORE:
   1. In Partner Center, reserve the app name (App management > App identity).
      That page gives you the exact values for Name and Publisher below -
      copy them exactly, don't guess.
-  2. Replace the two placeholders marked "REPLACE ME" below.
+  2. Replace the Name/Publisher/PublisherDisplayName values below (currently
+     set to local-test defaults - see note by Identity) with the real ones.
   3. Bump the Version field for every new submission (Partner Center
      rejects a resubmission with a version it has already seen). Format is
      Major.Minor.Build.0 - the last part (Revision) must stay 0.
+
+  These defaults are NOT placeholders in the "will fail to build" sense -
+  they're valid values that let `build_msix.ps1 -SignForTesting` produce a
+  package you can sideload-install on your own PC right now, before you've
+  reserved anything in Partner Center. The Publisher value below
+  (CN=ClipboardTyperLocalTest) deliberately matches the Subject of the
+  self-signed test certificate that script creates - MSIX requires those two
+  to match exactly for a signed package to install. Swap both to your real
+  Partner Center values before actually submitting.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -24,13 +34,13 @@
   IgnorableNamespaces="uap rescap">
 
   <Identity
-    Name="REPLACE ME - e.g. YourPublisherAlias.ClipboardTyper"
-    Publisher="REPLACE ME - e.g. CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+    Name="ClipboardTyper.LocalTest"
+    Publisher="CN=ClipboardTyperLocalTest"
     Version="1.0.0.0" />
 
   <Properties>
     <DisplayName>Clipboard Typer</DisplayName>
-    <PublisherDisplayName>REPLACE ME - your Partner Center publisher display name</PublisherDisplayName>
+    <PublisherDisplayName>Clipboard Typer (local test build)</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 
