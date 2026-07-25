@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AppxManifest.xml - MSIX package manifest for Clipboard Typer.
+
+  This declares a "Desktop Bridge" package: a normal Win32 EXE (built by
+  PyInstaller) running with full Win32 API access (rescap:runFullTrust),
+  NOT a sandboxed UWP app. That's required here because the app uses
+  system-wide keyboard hooks and SendInput, which the restricted UWP
+  sandbox does not allow.
+
+  BEFORE BUILDING:
+  1. In Partner Center, reserve the app name (App management > App identity).
+     That page gives you the exact values for Name and Publisher below -
+     copy them exactly, don't guess.
+  2. Replace the two placeholders marked "REPLACE ME" below.
+  3. Bump the Version field for every new submission (Partner Center
+     rejects a resubmission with a version it has already seen). Format is
+     Major.Minor.Build.0 - the last part (Revision) must stay 0.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="REPLACE ME - e.g. YourPublisherAlias.ClipboardTyper"
+    Publisher="REPLACE ME - e.g. CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+    Version="1.0.0.0" />
+
+  <Properties>
+    <DisplayName>Clipboard Typer</DisplayName>
+    <PublisherDisplayName>REPLACE ME - your Partner Center publisher display name</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Dependencies>
+    <!-- MSIX/Desktop Bridge requires Windows 10 1809 (17763) or later.
+         Windows 7/8/8.1 users are not reachable through this package -
+         they should keep using the plain clipboard_typer.py / EXE
+         distribution documented in the main README. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Applications>
+    <Application Id="ClipboardTyper" Executable="ClipboardTyper.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Clipboard Typer"
+        Description="Remembers your last 50 copied text items and lets you replay any of them as simulated keystrokes or a normal paste, using shortcuts separate from Windows' built-in clipboard history (Win+Alt+V / Ctrl+Alt+V)."
+        BackgroundColor="#2F6FED"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="default">
+        <uap:DefaultTile
+          Wide310x150Logo="Assets\Wide310x150Logo.png"
+          Square310x310Logo="Assets\Square310x310Logo.png"
+          Square71x71Logo="Assets\Square71x71Logo.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Full Win32 API access (keyboard hooks, SendInput, window
+         management) - not available to a sandboxed UWP app. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

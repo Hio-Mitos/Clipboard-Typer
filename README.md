@@ -150,3 +150,79 @@ A couple of things worth knowing when working across a remote session:
   blocking Ctrl+V), **Ctrl+Enter / Ctrl+click ("paste directly")** is
   simpler and relies on Remote Desktop's built-in clipboard redirection
   instead of simulated keystrokes at all.
+
+## Packaging for the Microsoft Store (MSIX)
+
+The `packaging/` folder has everything needed to build an MSIX package and
+submit it under Partner Center's **"MSIX or PWA app"** product type (choose
+the MSIX path — this is a Win32 desktop app, not a website or a game, so
+that's the one that fits). MSIX is Microsoft's recommended path for desktop
+apps: Store-managed updates, free Store code signing, and it registers the
+Start menu entry / search / Add-or-remove-programs listing for you — that's
+what makes the app show up when someone searches the Start menu after
+installing it, without any custom installer scripting.
+
+**Important scope note:** MSIX/Store distribution only works on Windows 10
+(1809+) and Windows 11. It doesn't reach Windows 7/8 users — for those, keep
+using the plain `clipboard_typer.py` / standalone EXE distribution described
+earlier in this README. The Store listing is an *additional* channel for
+Windows 10/11 users, not a replacement.
+
+### What's in `packaging/`
+
+- `AppxManifest.xml` — the package manifest (declares it as a full-trust
+  Win32 app via Desktop Bridge, not a sandboxed UWP app — required, since
+  the app uses system-wide keyboard hooks and `SendInput`).
+- `Assets/` — the icon set the manifest references (tile logos, store logo,
+  splash screen), generated to match the app's blue clipboard glyph. These
+  are functional placeholders; if you want a more polished/high-res set,
+  regenerate them from `Assets/Icon-Master-512.png` with the MSIX Packaging
+  Tool or Visual Studio's asset generator.
+- `build_msix.ps1` — builds the EXE and packs the `.msix` (see below).
+- `../clipboard_typer.spec` — the PyInstaller build config it uses.
+
+### One-time setup in Partner Center
+
+1. Create/sign in to your Partner Center developer account and reserve the
+   app name under **App management > App identity**.
+2. That page shows the exact **Package/Identity/Name** and **Publisher**
+   (a `CN=...` string) values for *your* reservation — copy them into
+   `AppxManifest.xml`, replacing the two `REPLACE ME` placeholders. Also set
+   `PublisherDisplayName` to your Partner Center publisher display name.
+
+### Building the package
+
+On a Windows machine with Python, this project's `requirements.txt`,
+`pyinstaller`, and the Windows SDK installed (the SDK ships makeappx.exe /
+signtool.exe — get it standalone or via Visual Studio):
+
+```powershell
+cd packaging
+.\build_msix.ps1
+```
+
+This runs PyInstaller, stages the EXE + manifest + assets, and produces
+`packaging/out/ClipboardTyper.msix`. Pass `-Version 1.1.0.0` to bump the
+package version, and add `-SignForTesting` if you want to sideload-install
+it on your own PC first to confirm it works before submitting (see the
+script's own comments — the test certificate it creates is only for that
+local check, not for the Store submission itself).
+
+### Submitting
+
+Unsigned `.msix` files are fine to upload — the Store re-signs the package
+itself during certification, so you don't need to sign it yourself unless
+you're testing a local sideload install. In Partner Center: create a
+submission, choose **MSIX or PWA app → MSIX**, upload
+`packaging/out/ClipboardTyper.msix`, fill in the Store listing (description,
+screenshots, age rating, etc.), and submit for certification.
+
+Because the app installs a system-wide keyboard hook and simulates
+keystrokes into other apps, it's worth writing a plain-language explanation
+of *why* in the Store listing description (clipboard history + "type
+instead of paste" accessibility-style tool) — reviewers look more closely at
+anything that touches global input.
+
+Remember to bump `<Identity Version="...">` for every new submission —
+Partner Center rejects a resubmission that reuses a version it has already
+seen.

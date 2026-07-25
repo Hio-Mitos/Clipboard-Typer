@@ -10,7 +10,16 @@ env/
 # PyInstaller build output (see README "Run automatically at startup")
 build/
 dist/
+# clipboard_typer.spec is checked in on purpose (it's the packaging build
+# config, not a throwaway auto-generated one) - only ignore other/generated
+# spec files.
 *.spec
+!clipboard_typer.spec
+
+# MSIX packaging build output (see packaging/build_msix.ps1)
+packaging/staging/
+packaging/out/
+packaging/*.pfx
 
 # Editor/IDE
 .vscode/
