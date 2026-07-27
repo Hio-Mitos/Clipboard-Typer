@@ -33,18 +33,23 @@ Run:
 """
 
 import ctypes
+import os
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import winreg
 from collections import deque
 
 import keyboard
 import pyperclip
-import win32gui
-import win32con
-import win32process
 import win32api
+import win32con
+import win32event
+import win32gui
+import win32process
+import winerror
 import pystray
 from PIL import Image, ImageDraw
 import tkinter as tk
@@ -65,6 +70,27 @@ BREATHER_EVERY = 40               # extra pause every N characters, lets the
 BREATHER_DELAY = 0.05             # target app's input queue catch its breath
 MANAGER_INACTIVITY_MS = 20_000    # auto-close the history flyout after this much idle time
 
+# Single-instance guard. "Global\" (not "Local\") so the check also holds
+# across different user sessions / RDP sessions on the same machine, not
+# just within the current login.
+SINGLE_INSTANCE_MUTEX_NAME = r"Global\ClipboardTyperSingleInstanceMutex"
+
+# Persisted settings (per-user, survive restarts) live under this registry
+# key - just two small DWORD flags, nothing sensitive.
+SETTINGS_REG_PATH = r"Software\ClipboardTyper"
+STARTUP_RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_RUN_VALUE_NAME = "ClipboardTyper"
+
+# "Always Running" = auto-restart the app if it crashes. To avoid spinning
+# forever on a crash that happens instantly every time (a real, unfixable
+# bug), we cap consecutive *fast* restarts and pass the count to the child
+# via an environment variable; a child that stays up longer than the reset
+# window below is considered "recovered" and clears the counter for any
+# future crash.
+CRASH_RESTART_ENV_VAR = "CLIPBOARD_TYPER_RESTART_COUNT"
+MAX_FAST_CRASH_RESTARTS = 5
+CRASH_RESTART_RESET_AFTER_SECONDS = 30
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
@@ -75,6 +101,11 @@ monitoring_enabled = True
 _manager_open = False
 _hotkey_refs = {}
 _hotkey_lock = threading.Lock()
+
+_instance_mutex_handle = None
+always_running_enabled = True
+run_at_startup_enabled = False
+_crash_restart_recovered = False  # flips true after CRASH_RESTART_RESET_AFTER_SECONDS of uptime
 
 
 # ---------------------------------------------------------------------------
@@ -119,23 +150,231 @@ def _thread_crash_handler(args):
 def _main_crash_handler(exc_type, exc_value, exc_tb):
     """Installed as sys.excepthook: catches any crash that escapes main()
     itself (main thread), e.g. a bug during startup or in the tray icon's
-    own event loop."""
+    own event loop.
+
+    If "Always Running" is turned on (see the tray menu), this also tries to
+    relaunch a fresh copy of the app before exiting, instead of just leaving
+    it dead - see _attempt_crash_restart() below for the crash-loop guard."""
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_tb)
         return
     details = _format_exc(exc_type, exc_value, exc_tb)
-    _show_error_box(
-        f"{APP_TITLE} - stopped unexpectedly",
-        "Clipboard Typer has crashed and is no longer running in the "
-        "background, because of an internal error - not something you did.\n\n"
-        "You'll need to start it again (from its shortcut, or by re-running "
-        "clipboard_typer.py) to get the shortcuts working again.\n\n"
-        f"Details:\n{details}",
-    )
+
+    restarted = _attempt_crash_restart()
+
+    if restarted:
+        _show_error_box(
+            f"{APP_TITLE} - restarting after a crash",
+            "Clipboard Typer hit an internal error and stopped, but "
+            "'Always Running' is turned on, so it is relaunching itself "
+            "automatically now.\n\n"
+            f"Details:\n{details}",
+        )
+    else:
+        extra = (
+            ""
+            if not always_running_enabled
+            else (
+                "\n\n'Always Running' is on, but the app crashed too many times in a "
+                "row, so automatic restarting has been paused for this session to "
+                "avoid a crash loop - please check the details below."
+            )
+        )
+        _show_error_box(
+            f"{APP_TITLE} - stopped unexpectedly",
+            "Clipboard Typer has crashed and is no longer running in the "
+            "background, because of an internal error - not something you did.\n\n"
+            "You'll need to start it again (from its shortcut, or by re-running "
+            "clipboard_typer.py) to get the shortcuts working again."
+            f"{extra}\n\n"
+            f"Details:\n{details}",
+        )
+    os._exit(1)
 
 
 threading.excepthook = _thread_crash_handler
 sys.excepthook = _main_crash_handler
+
+
+# ---------------------------------------------------------------------------
+# Persisted settings (registry) - "Always Running" and "Run at startup" are
+# simple on/off toggles, so a couple of DWORD values under HKCU is enough;
+# no need for a config file.
+# ---------------------------------------------------------------------------
+def _get_setting(name, default):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SETTINGS_REG_PATH) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return bool(value)
+    except OSError:
+        return default
+
+
+def _set_setting(name, value):
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, SETTINGS_REG_PATH)
+        with key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, 1 if value else 0)
+    except OSError:
+        pass
+
+
+def _load_persisted_settings():
+    global always_running_enabled, run_at_startup_enabled
+    always_running_enabled = _get_setting("AlwaysRunning", True)
+    run_at_startup_enabled = _startup_shortcut_exists()
+
+
+# ---------------------------------------------------------------------------
+# Run at startup (HKCU ...\CurrentVersion\Run)
+# ---------------------------------------------------------------------------
+def _self_launch_command():
+    """The exact command line that relaunches this app, whether it's running
+    as a frozen PyInstaller .exe or as a plain .py script."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    script_path = os.path.abspath(__file__)
+    # Prefer pythonw.exe (no console window) alongside the current
+    # interpreter, falling back to whatever interpreter is currently running.
+    python_dir = os.path.dirname(sys.executable)
+    pythonw = os.path.join(python_dir, "pythonw.exe")
+    interpreter = pythonw if os.path.exists(pythonw) else sys.executable
+    return f'"{interpreter}" "{script_path}"'
+
+
+def _startup_shortcut_exists():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY_PATH) as key:
+            winreg.QueryValueEx(key, STARTUP_RUN_VALUE_NAME)
+            return True
+    except OSError:
+        return False
+
+
+def _set_run_at_startup(enabled):
+    global run_at_startup_enabled
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY_PATH)
+        with key:
+            if enabled:
+                winreg.SetValueEx(key, STARTUP_RUN_VALUE_NAME, 0, winreg.REG_SZ, _self_launch_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_RUN_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        run_at_startup_enabled = enabled
+    except OSError as exc:
+        _show_error_box(
+            f"{APP_TITLE} - couldn't update startup setting",
+            f"Could not change the 'Run at startup' setting.\n\nDetails: {exc}",
+        )
+
+
+def toggle_run_at_startup(icon, item):
+    _set_run_at_startup(not run_at_startup_enabled)
+
+
+# ---------------------------------------------------------------------------
+# Elevation ("type into admin-elevated app credential boxes")
+#
+# A standard-privilege process cannot send synthetic input into a
+# higher-integrity (elevated / "Run as administrator") window - Windows'
+# User Interface Privilege Isolation (UIPI) blocks that by design, the same
+# protection that stops a low-privilege app from tampering with an admin
+# one. Running Clipboard Typer itself elevated removes that barrier for
+# ordinary elevated app windows (e.g. a login/credential box inside an
+# elevated app, an elevated installer, an admin console).
+#
+# Important limit: this does NOT reach the true Secure Desktop UAC consent
+# prompt itself (the "Do you want to allow this app to make changes"
+# dialog, or its credential-entry variant) - that runs on a separate,
+# isolated desktop that no ordinary application, elevated or not, is
+# allowed to inject input into. That boundary is intentional and can't be
+# bypassed by this app; see the README for the full explanation.
+# ---------------------------------------------------------------------------
+def _is_elevated():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _release_instance_mutex():
+    global _instance_mutex_handle
+    if _instance_mutex_handle is not None:
+        try:
+            win32event.ReleaseMutex(_instance_mutex_handle)
+        except Exception:
+            pass
+        try:
+            win32api.CloseHandle(_instance_mutex_handle)
+        except Exception:
+            pass
+        _instance_mutex_handle = None
+
+
+def relaunch_elevated(icon=None, item=None):
+    """Relaunch this app with an elevation (UAC) prompt, so it can type into
+    other elevated apps' windows. Exits the current, non-elevated instance
+    once the elevated one is confirmed launching."""
+    if _is_elevated():
+        _show_error_box(APP_TITLE, "Clipboard Typer is already running as Administrator.")
+        return
+    try:
+        if getattr(sys, "frozen", False):
+            exe, params = sys.executable, ""
+        else:
+            script_path = os.path.abspath(__file__)
+            exe, params = sys.executable, f'"{script_path}"'
+        # ShellExecuteW with the "runas" verb is what actually triggers the
+        # UAC consent prompt - a plain CreateProcess/subprocess call cannot
+        # elevate a process on its own.
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        if result <= 32:
+            raise OSError(f"ShellExecuteW returned {result}")
+    except Exception as exc:
+        _show_error_box(
+            f"{APP_TITLE} - couldn't restart as Administrator",
+            "Restarting elevated was cancelled or failed (e.g. you clicked 'No' "
+            f"on the UAC prompt).\n\nDetails: {exc}",
+        )
+        return
+    # Release our slot in the single-instance mutex *before* exiting, so the
+    # elevated copy that's about to start doesn't see itself as a duplicate.
+    _release_instance_mutex()
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Crash-loop guard for "Always Running"
+# ---------------------------------------------------------------------------
+def _mark_crash_restart_recovered():
+    global _crash_restart_recovered
+    _crash_restart_recovered = True
+
+
+def _attempt_crash_restart():
+    """Relaunch a fresh copy of the app after an unhandled crash, if 'Always
+    Running' is enabled. Returns True if a restart was actually launched."""
+    if not always_running_enabled:
+        return False
+
+    prev_count = 0 if _crash_restart_recovered else int(os.environ.get(CRASH_RESTART_ENV_VAR, "0"))
+    if prev_count >= MAX_FAST_CRASH_RESTARTS:
+        return False
+
+    try:
+        env = dict(os.environ)
+        env[CRASH_RESTART_ENV_VAR] = str(prev_count + 1)
+        if getattr(sys, "frozen", False):
+            subprocess.Popen([sys.executable], env=env, close_fds=True)
+        else:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=env, close_fds=True)
+        _release_instance_mutex()
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -960,14 +1199,25 @@ def clear_history(icon, item):
         history.clear()
 
 
+def toggle_always_running(icon, item):
+    global always_running_enabled
+    always_running_enabled = not always_running_enabled
+    _set_setting("AlwaysRunning", always_running_enabled)
+
+
 def quit_app(icon, item):
     icon.stop()
+    _release_instance_mutex()
     # daemon threads will exit with the process
-    import os
     os._exit(0)
 
 
 def run_tray():
+    elevation_label = (
+        "Running as Administrator"
+        if _is_elevated()
+        else "Restart as Administrator (for admin app credential boxes)"
+    )
     icon = pystray.Icon(
         "clipboard_typer",
         _make_icon_image(),
@@ -981,6 +1231,23 @@ def run_tray():
                 checked=lambda item: monitoring_enabled,
             ),
             pystray.MenuItem("Clear history", clear_history),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                elevation_label,
+                relaunch_elevated,
+                enabled=not _is_elevated(),
+            ),
+            pystray.MenuItem(
+                "Always running (auto-restart if it crashes)",
+                toggle_always_running,
+                checked=lambda item: always_running_enabled,
+            ),
+            pystray.MenuItem(
+                "Run at startup",
+                toggle_run_at_startup,
+                checked=lambda item: run_at_startup_enabled,
+            ),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app),
         ),
     )
@@ -991,6 +1258,33 @@ def run_tray():
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    global _instance_mutex_handle
+
+    # --- Single-instance guard --------------------------------------------
+    # A named mutex is visible across the whole session (and, with the
+    # "Global\" prefix, across other sessions too) the instant it's
+    # created - checking GetLastError() right after CreateMutex tells us
+    # whether we're the first copy or a duplicate, with no race window.
+    _instance_mutex_handle = win32event.CreateMutex(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        _show_error_box(
+            APP_TITLE,
+            "Clipboard Typer is already running (check your system tray).\n\n"
+            "Only one copy can run at a time, so the shortcuts and clipboard "
+            "history stay consistent.",
+        )
+        try:
+            win32api.CloseHandle(_instance_mutex_handle)
+        except Exception:
+            pass
+        os._exit(0)
+
+    _load_persisted_settings()
+    # If this process is still alive after a while, treat it as recovered:
+    # a future crash starts the fast-restart counter back at zero instead
+    # of inheriting whatever count this process itself was launched with.
+    threading.Timer(CRASH_RESTART_RESET_AFTER_SECONDS, _mark_crash_restart_recovered).start()
+
     _enable_dpi_awareness()
 
     threading.Thread(target=monitor_clipboard, daemon=True, name="ClipboardMonitor").start()

@@ -34,13 +34,13 @@
   IgnorableNamespaces="uap rescap">
 
   <Identity
-    Name="ClipboardTyper.LocalTest"
-    Publisher="CN=ClipboardTyperLocalTest"
+    Name="HioMitos.ClipboardTyper"
+    Publisher="CN=38F8D0C3-60ED-4372-AF18-8C253AB50DF2"
     Version="1.0.0.0" />
 
   <Properties>
-    <DisplayName>Clipboard Typer</DisplayName>
-    <PublisherDisplayName>Clipboard Typer (local test build)</PublisherDisplayName>
+    <DisplayName>Clipboard_Typer</DisplayName>
+    <PublisherDisplayName>Hio Mitos</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 

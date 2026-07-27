@@ -64,12 +64,25 @@ python clipboard_typer.py
 
 Runs in the background with a system tray icon (clipboard glyph). Right-click
 the tray icon for: open manager, type most recent, pause/resume monitoring,
-clear history, quit.
+clear history, restart as Administrator, Always running, Run at startup, quit.
 
 To run without a console window: use `pythonw.exe clipboard_typer.py` instead
 of `python.exe`.
 
+Only one copy can run at a time — if you try to start a second one (double-clicking
+the shortcut/EXE again, for example), it shows a message box saying Clipboard
+Typer is already running and exits immediately, instead of creating a
+conflicting second instance.
+
 ## Run automatically at startup
+
+The easiest way is the tray menu's **"Run at startup"** checkbox — it adds
+(or removes) a `HKEY_CURRENT_USER\...\CurrentVersion\Run` registry entry
+pointing at the current install (the frozen `.exe` if you're running the
+packaged build, or `pythonw.exe clipboard_typer.py` otherwise). No admin
+rights needed, since it's a per-user registry key.
+
+You can also do it manually:
 
 1. Press `Win+R`, type `shell:startup`, hit Enter.
 2. Create a shortcut in that folder pointing to:
@@ -85,14 +98,60 @@ pyinstaller --onefile --noconsole --name ClipboardTyper clipboard_typer.py
 The .exe will be in `dist\ClipboardTyper.exe` — you can point a startup
 shortcut at that instead, so Python doesn't need to be installed.
 
+## Always running (auto-restart after a crash)
+
+The tray menu's **"Always running"** checkbox (on by default, persisted in
+the registry) makes the app relaunch itself automatically if it hits an
+unhandled error and crashes, instead of just staying dead until you notice
+and restart it by hand. You still get the usual crash message box either
+way — it just also says a fresh copy is being started.
+
+To avoid a rapid crash-loop (the same bug crashing the app over and over,
+every restart), it caps itself at 5 fast consecutive restarts; if the app
+has been running fine for 30+ seconds it's considered "recovered" and that
+counter resets, so a single flaky crash weeks apart from another one never
+gets throttled. If it does hit the cap, the crash box says so and
+auto-restarting is paused for that session — turning "Always running" off
+and back on (or just starting it manually) resets it.
+
+This only catches crashes Python itself can see (an unhandled exception).
+It can't recover from things outside the process entirely, like the OS
+killing it or a hard interpreter/DLL-level crash.
+
+## Typing into elevated (Run as Administrator) apps
+
+By default, Clipboard Typer runs at normal/standard privilege, and Windows'
+User Interface Privilege Isolation (UIPI) blocks a standard-privilege
+process from sending simulated keystrokes into a higher-privilege
+("elevated" / "Run as administrator") window — the same protection that
+stops a low-privilege app from tampering with an admin one. That shows up
+as the shortcuts silently doing nothing when the window you're typing into
+belongs to an elevated app (for example, a login/credential box inside an
+elevated installer or admin tool).
+
+The tray menu's **"Restart as Administrator"** item relaunches Clipboard
+Typer elevated (you'll get the normal Windows UAC prompt) and exits the
+non-elevated copy. Once it's running elevated, typing/pasting works into
+both ordinary and elevated windows. The tray menu shows "Running as
+Administrator" once that's active, and the item is disabled since there's
+nothing further to do.
+
+**What this does *not* reach:** the actual Secure Desktop UAC prompt itself
+— the "Do you want to allow this app to make changes to your device?" box,
+or its credential-entry variant — runs on a completely separate, isolated
+desktop that no application, elevated or not, is permitted to inject input
+into. That's a deliberate, unbypassable Windows security boundary, not a
+limitation of this app; there's no legitimate way for any third-party tool
+to type into that specific dialog.
+
 ## Notes / limitations
 
 - History (last 50 items) is kept in memory only and resets when the app
   restarts, as requested.
 - If the global shortcuts don't respond inside a specific app, that app may
-  be running as Administrator — try running `clipboard_typer.py` as
-  Administrator too (both processes need to be at the same privilege level
-  for Windows to deliver the keyboard hook).
+  be running as Administrator — use the tray menu's **"Restart as
+  Administrator"** item (see below) so both processes are at the same
+  privilege level.
 - Constants at the top of `clipboard_typer.py` (`HISTORY_MAXLEN`,
   `MANAGER_HOTKEY`, `QUICK_TYPE_HOTKEY`, typing speed delays) can be changed
   directly if you want a different history size, different shortcuts, or
