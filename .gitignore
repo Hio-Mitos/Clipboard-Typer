@@ -29,3 +29,5 @@ packaging/*.pfx
 # OS cruft
 Thumbs.db
 .DS_Store
+/TypePaste-CHROME
+/TypePaste-EDGE
