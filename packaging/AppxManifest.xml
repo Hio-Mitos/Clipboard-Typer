@@ -36,7 +36,7 @@
   <Identity
     Name="HioMitos.ClipboardTyper"
     Publisher="CN=38F8D0C3-60ED-4372-AF18-8C253AB50DF2"
-    Version="1.0.0.0" />
+    Version="1.2.0.0" />
 
   <Properties>
     <DisplayName>Clipboard_Typer</DisplayName>

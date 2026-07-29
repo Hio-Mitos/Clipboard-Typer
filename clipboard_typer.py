@@ -25,7 +25,7 @@ Compatible with Windows 7, 8, 8.1, 10, 11 and later (see README for the
 Python version to use on each).
 
 Requirements (Windows only):
-    pip install keyboard pyperclip pywin32 pystray pillow
+    pip install pyperclip pywin32 pystray pillow
 
 Run:
     pythonw.exe clipboard_typer.py      (no console window)
@@ -33,6 +33,7 @@ Run:
 """
 
 import ctypes
+import ctypes.wintypes as wintypes
 import os
 import subprocess
 import sys
@@ -42,7 +43,6 @@ import traceback
 import winreg
 from collections import deque
 
-import keyboard
 import pyperclip
 import win32api
 import win32con
@@ -54,6 +54,7 @@ import pystray
 from PIL import Image, ImageDraw
 import tkinter as tk
 from tkinter import ttk
+from tkinter import messagebox
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,8 +62,34 @@ from tkinter import ttk
 APP_TITLE = "Clipboard Typer"
 HISTORY_MAXLEN = 50              # keep last 50 copied text items, in memory only
 POLL_INTERVAL = 0.4              # seconds between clipboard checks
-MANAGER_HOTKEY = "windows+alt+v"
-QUICK_TYPE_HOTKEY = "ctrl+alt+v"
+
+# Global hotkeys, registered with the native Win32 RegisterHotKey API (see
+# the "Global hotkeys" section below) rather than a third-party low-level
+# keyboard hook. RegisterHotKey is the OS-sanctioned mechanism for exactly
+# this purpose - it reliably delivers WM_HOTKEY regardless of the Windows
+# key being involved, and isn't subject to being silently filtered by
+# security/endpoint software the way a raw global hook can be (this is what
+# caused Win+Alt+V to be reported as "unusable" during Store certification -
+# it worked on our own dev machine but not on Microsoft's locked-down test
+# device).
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+VK_V_KEY = 0x56  # 'V'
+
+HOTKEY_ID_MANAGER = 1
+HOTKEY_ID_QUICK_TYPE = 2
+
+# Factory-default shortcuts. Users can personalize both from the tray menu's
+# "Customize shortcuts..." dialog - see manager_hotkey_mods/vk and
+# quick_type_hotkey_mods/vk in Shared state below for the live values.
+DEFAULT_MANAGER_HOTKEY_MODS = MOD_WIN | MOD_ALT
+DEFAULT_MANAGER_HOTKEY_VK = VK_V_KEY
+DEFAULT_QUICK_TYPE_HOTKEY_MODS = MOD_CONTROL | MOD_ALT
+DEFAULT_QUICK_TYPE_HOTKEY_VK = VK_V_KEY
+
 CHAR_DELAY = 0.014                # delay after each keystroke, before the next one
 KEY_PRESS_GAP = 0.004             # delay between a key's down and its up event
 NEWLINE_DELAY = 0.022
@@ -99,12 +126,22 @@ history_lock = threading.Lock()
 last_seen_value = None
 monitoring_enabled = True
 _manager_open = False
-_hotkey_refs = {}
-_hotkey_lock = threading.Lock()
+_hotkey_thread_id = None  # native thread ID of the hotkey listener, for clean shutdown
+_hotkey_thread = None
+
+# Live, user-personalizable shortcut bindings. Loaded from the registry in
+# _load_persisted_settings(); changed via the tray menu's "Customize
+# shortcuts..." dialog (open_hotkey_settings), which also persists them and
+# restarts the hotkey listener with the new values.
+manager_hotkey_mods = DEFAULT_MANAGER_HOTKEY_MODS
+manager_hotkey_vk = DEFAULT_MANAGER_HOTKEY_VK
+quick_type_hotkey_mods = DEFAULT_QUICK_TYPE_HOTKEY_MODS
+quick_type_hotkey_vk = DEFAULT_QUICK_TYPE_HOTKEY_VK
 
 _instance_mutex_handle = None
 always_running_enabled = True
 run_at_startup_enabled = False
+esc_cancels_typing_enabled = True  # optional: Esc stops an in-progress typing burst
 _crash_restart_recovered = False  # flips true after CRASH_RESTART_RESET_AFTER_SECONDS of uptime
 
 
@@ -197,8 +234,8 @@ sys.excepthook = _main_crash_handler
 
 
 # ---------------------------------------------------------------------------
-# Persisted settings (registry) - "Always Running" and "Run at startup" are
-# simple on/off toggles, so a couple of DWORD values under HKCU is enough;
+# Persisted settings (registry) - "Always Running", "Run at startup", and the
+# two customizable shortcut bindings are all small DWORD values under HKCU;
 # no need for a config file.
 # ---------------------------------------------------------------------------
 def _get_setting(name, default):
@@ -219,10 +256,34 @@ def _set_setting(name, value):
         pass
 
 
+def _get_reg_int(name, default):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SETTINGS_REG_PATH) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return int(value)
+    except OSError:
+        return default
+
+
+def _set_reg_int(name, value):
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, SETTINGS_REG_PATH)
+        with key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+    except OSError:
+        pass
+
+
 def _load_persisted_settings():
-    global always_running_enabled, run_at_startup_enabled
+    global always_running_enabled, run_at_startup_enabled, esc_cancels_typing_enabled
+    global manager_hotkey_mods, manager_hotkey_vk, quick_type_hotkey_mods, quick_type_hotkey_vk
     always_running_enabled = _get_setting("AlwaysRunning", True)
     run_at_startup_enabled = _startup_shortcut_exists()
+    esc_cancels_typing_enabled = _get_setting("EscCancelsTyping", True)
+    manager_hotkey_mods = _get_reg_int("ManagerHotkeyMods", DEFAULT_MANAGER_HOTKEY_MODS)
+    manager_hotkey_vk = _get_reg_int("ManagerHotkeyVk", DEFAULT_MANAGER_HOTKEY_VK)
+    quick_type_hotkey_mods = _get_reg_int("QuickTypeHotkeyMods", DEFAULT_QUICK_TYPE_HOTKEY_MODS)
+    quick_type_hotkey_vk = _get_reg_int("QuickTypeHotkeyVk", DEFAULT_QUICK_TYPE_HOTKEY_VK)
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +499,14 @@ VK_MENU = 0x12       # Alt
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
+
+# ctypes.windll.user32.GetAsyncKeyState is used both here (to let Esc cancel
+# an in-progress typing burst - see type_text) and later by the shortcut
+# customization dialog. Declared once, up front, so both call sites share
+# the same signature.
+ctypes.windll.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+ctypes.windll.user32.GetAsyncKeyState.restype = ctypes.c_short
 
 # VkKeyScanW(ch) -> a real virtual-key + shift-state for the current
 # keyboard layout, when that character can be typed at all with the active
@@ -613,61 +682,170 @@ def type_text(text):
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
 
-    # Our own global hotkey hook (Win+Alt+V / Ctrl+Alt+V) sees every
-    # synthetic keystroke system-wide too. Running its Python callback for
-    # each of the hundreds of events below, on the same GIL as this typing
-    # loop, is what causes events to back up and a key to look "stuck" /
-    # repeated in the output. Pausing the hotkeys for the duration of the
-    # typing burst removes that contention entirely.
-    _unregister_hotkeys()
-    try:
-        _release_modifiers()
-        char_count = 0
-        for i, line in enumerate(lines):
-            for ch in line:
-                _type_char(ch)
-                char_count += 1
-                if char_count % BREATHER_EVERY == 0:
-                    time.sleep(BREATHER_DELAY)
-            if i < len(lines) - 1:
-                _send_shift_enter()
-    finally:
-        _register_hotkeys()
+    # Note: earlier versions of this app paused/resumed a third-party global
+    # keyboard hook here, because that hook ran a Python callback for every
+    # synthetic keystroke below and the resulting GIL contention could cause
+    # a character to repeat while its neighbour dropped. Now that hotkeys are
+    # registered with the native RegisterHotKey API instead (see "Global
+    # hotkeys" below), WM_HOTKEY only ever fires for the exact registered key
+    # combination - never for the individual characters typed here - so that
+    # contention no longer exists and nothing needs to be paused.
+    _release_modifiers()
+    char_count = 0
+    for i, line in enumerate(lines):
+        cancelled = False
+        for ch in line:
+            # Optional: if the user is holding Esc, stop the burst right
+            # here instead of continuing to type the rest of the text.
+            # Checked before every character (not just periodically) so a
+            # long paste can be interrupted almost the instant Esc is
+            # pressed, not just at the next breather pause.
+            if esc_cancels_typing_enabled and (ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000):
+                cancelled = True
+                break
+            _type_char(ch)
+            char_count += 1
+            if char_count % BREATHER_EVERY == 0:
+                time.sleep(BREATHER_DELAY)
+        if cancelled:
+            break
+        if i < len(lines) - 1:
+            _send_shift_enter()
 
 
 # ---------------------------------------------------------------------------
-# Global hotkey (de)registration
+# Global hotkeys
 #
-# Kept separate so the typing routine can unhook completely for the brief
-# duration of a keystroke burst (see type_text) and reliably restore
-# afterwards, even if something goes wrong mid-burst.
+# Registered with the native Win32 RegisterHotKey() API instead of a
+# third-party low-level keyboard hook. This matters for two reasons:
+#   - RegisterHotKey is the OS's own supported mechanism for exactly this
+#     use case, and reliably fires WM_HOTKEY even for Windows-key
+#     combinations - a raw global hook can be delayed, filtered, or blocked
+#     by security/endpoint software, which is what made Win+Alt+V work on
+#     our own dev machine but get reported as "unusable" by the Microsoft
+#     Store certification test device.
+#   - It only ever delivers a message for the *exact* registered combo, so
+#     it doesn't see (and can't be confused by) the hundreds of individual
+#     synthetic keystrokes type_text() sends during a typing burst.
 #
-# Important: we call keyboard.unhook_all() here rather than
-# keyboard.remove_hotkey() for each hotkey. remove_hotkey() only removes our
-# handlers - the module's low-level, system-wide keyboard hook keeps running
-# underneath and still runs a Python callback for every one of our own
-# synthetic keystrokes. That callback competes with the typing loop for the
-# GIL, and that contention is what causes a character to be typed twice
-# while its neighbour gets dropped. unhook_all() removes the OS-level hook
-# itself, so nothing intercepts our own typing traffic while it's in flight.
+# RegisterHotKey with hWnd=None posts WM_HOTKEY to the calling *thread's*
+# message queue rather than to a window, so a small dedicated thread just
+# registers both hotkeys and runs a standard GetMessage/DispatchMessage loop
+# for the lifetime of the app.
 # ---------------------------------------------------------------------------
-def _register_hotkeys():
-    with _hotkey_lock:
-        if _hotkey_refs:
-            return  # already registered
-        _hotkey_refs["manager"] = keyboard.add_hotkey(MANAGER_HOTKEY, open_manager)
-        _hotkey_refs["quick"] = keyboard.add_hotkey(QUICK_TYPE_HOTKEY, quick_type_latest)
+user32 = ctypes.windll.user32
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = ctypes.c_int
+user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+# GetAsyncKeyState's signature is already declared near the top of the file
+# (ctypes.windll.user32 is the same cached DLL object as this module-level
+# `user32`), reused here for the shortcut-recording dialog below.
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+user32.GetKeyNameTextW.argtypes = [ctypes.c_long, wintypes.LPWSTR, ctypes.c_int]
+user32.GetKeyNameTextW.restype = ctypes.c_int
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
 
 
-def _unregister_hotkeys():
-    with _hotkey_lock:
-        if not _hotkey_refs:
-            return
-        try:
-            keyboard.unhook_all()
-        except Exception:
-            pass
-        _hotkey_refs.clear()
+def _vk_display_name(vk):
+    """Human-readable name for a virtual-key code, e.g. 0x56 -> 'V',
+    0x70 -> 'F1' - used to show the current shortcuts in the tray menu and
+    the customization dialog."""
+    scan = user32.MapVirtualKeyW(vk, 0)  # MAPVK_VK_TO_VSC
+    if scan:
+        buf = ctypes.create_unicode_buffer(32)
+        if user32.GetKeyNameTextW(scan << 16, buf, 32) > 0 and buf.value:
+            return buf.value
+    return f"Key 0x{vk:02X}"
+
+
+def _hotkey_display(mods, vk):
+    parts = []
+    if mods & MOD_WIN:
+        parts.append("Win")
+    if mods & MOD_CONTROL:
+        parts.append("Ctrl")
+    if mods & MOD_ALT:
+        parts.append("Alt")
+    if mods & MOD_SHIFT:
+        parts.append("Shift")
+    parts.append(_vk_display_name(vk))
+    return "+".join(parts)
+
+
+def _hotkey_listener_loop():
+    global _hotkey_thread_id
+    _hotkey_thread_id = win32api.GetCurrentThreadId()
+
+    ok_manager = user32.RegisterHotKey(
+        None, HOTKEY_ID_MANAGER, manager_hotkey_mods | MOD_NOREPEAT, manager_hotkey_vk
+    )
+    ok_quick = user32.RegisterHotKey(
+        None, HOTKEY_ID_QUICK_TYPE, quick_type_hotkey_mods | MOD_NOREPEAT, quick_type_hotkey_vk
+    )
+    if not ok_manager or not ok_quick:
+        failed = []
+        if not ok_manager:
+            failed.append(_hotkey_display(manager_hotkey_mods, manager_hotkey_vk))
+        if not ok_quick:
+            failed.append(_hotkey_display(quick_type_hotkey_mods, quick_type_hotkey_vk))
+        _show_error_box(
+            f"{APP_TITLE} - shortcut already in use",
+            "Couldn't register the following shortcut(s), because another "
+            "running app has already claimed them:\n\n"
+            + "\n".join(failed)
+            + "\n\nClose the other app (or change its shortcut), or pick a "
+            "different combination from the tray menu's 'Customize "
+            "shortcuts...' dialog.",
+        )
+
+    msg = wintypes.MSG()
+    while True:
+        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if ret <= 0:
+            break
+        if msg.message == WM_HOTKEY:
+            if msg.wParam == HOTKEY_ID_MANAGER:
+                open_manager()
+            elif msg.wParam == HOTKEY_ID_QUICK_TYPE:
+                quick_type_latest()
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+    if ok_manager:
+        user32.UnregisterHotKey(None, HOTKEY_ID_MANAGER)
+    if ok_quick:
+        user32.UnregisterHotKey(None, HOTKEY_ID_QUICK_TYPE)
+
+
+def _start_hotkey_listener():
+    global _hotkey_thread
+    _hotkey_thread = threading.Thread(target=_hotkey_listener_loop, daemon=True, name="HotkeyListener")
+    _hotkey_thread.start()
+
+
+def _stop_hotkey_listener():
+    """Ask the listener thread's message loop to exit and wait for it - used
+    when the user changes their shortcuts, so the old bindings are released
+    before the new ones are registered."""
+    global _hotkey_thread, _hotkey_thread_id
+    if _hotkey_thread_id is not None:
+        user32.PostThreadMessageW(_hotkey_thread_id, WM_QUIT, 0, 0)
+    if _hotkey_thread is not None:
+        _hotkey_thread.join(timeout=2)
+    _hotkey_thread = None
+    _hotkey_thread_id = None
+
+
+def restart_hotkey_listener():
+    _stop_hotkey_listener()
+    _start_hotkey_listener()
 
 
 # ---------------------------------------------------------------------------
@@ -726,12 +904,18 @@ def _restore_foreground(hwnd):
         pass
 
 
+def _send_ctrl_v():
+    _send(_vk_event(VK_CONTROL), _vk_event(VK_V_KEY))
+    time.sleep(KEY_PRESS_GAP)
+    _send(_vk_event(VK_V_KEY, keyup=True), _vk_event(VK_CONTROL, keyup=True))
+
+
 def _paste_directly(hwnd, text):
     _restore_foreground(hwnd)
     time.sleep(0.03)
     try:
         pyperclip.copy(text)
-        keyboard.send("ctrl+v")
+        _send_ctrl_v()
     except Exception:
         pass
 
@@ -1176,6 +1360,317 @@ def open_manager():
 
 
 # ---------------------------------------------------------------------------
+# Shortcut customization dialog (tray menu -> "Customize shortcuts...")
+#
+# Lets the user personalize both global shortcuts. Recording a new
+# combination is done by polling GetAsyncKeyState while this dialog has
+# focus (not a global hook) - the user must hold at least one modifier
+# (Ctrl/Alt/Shift/Win) and press a non-modifier key, or press Esc to cancel.
+# Saving validates that the two shortcuts differ and that each one isn't
+# already claimed by another running app (via a throwaway test
+# RegisterHotKey/UnregisterHotKey call), persists the choice to the
+# registry, and restarts the hotkey listener with the new bindings.
+# ---------------------------------------------------------------------------
+_RECORD_IGNORE_VKS = {
+    VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN,
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,  # left/right-specific modifier VKs
+    0x01, 0x02, 0x04, 0x05, 0x06,        # mouse buttons
+    VK_ESCAPE,                            # reserved to cancel recording
+}
+_HOTKEY_TEST_ID = 0xF000
+
+
+def open_hotkey_settings(icon=None, item=None):
+    def build_ui():
+        root = tk.Tk()
+        root.title(f"{APP_TITLE} - Customize Shortcuts")
+        root.resizable(False, False)
+        root.configure(bg=BG_COLOR)
+        root.attributes("-topmost", True)
+
+        def _tk_callback_exception(exc_type, exc_value, exc_tb):
+            _thread_crash_handler(
+                threading.ExceptHookArgs(exc_type, exc_value, exc_tb, threading.current_thread())
+            )
+
+        root.report_callback_exception = _tk_callback_exception
+
+        pending = {
+            "manager": (manager_hotkey_mods, manager_hotkey_vk),
+            "quick": (quick_type_hotkey_mods, quick_type_hotkey_vk),
+        }
+        recording = {"key": None, "poll_job": None}
+        value_labels = {}
+        change_buttons = {}
+        status_var = tk.StringVar(value="")
+
+        container = tk.Frame(root, bg=BG_COLOR, padx=18, pady=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            container,
+            text="Customize Shortcuts",
+            bg=BG_COLOR,
+            fg=TEXT_PRIMARY,
+            font=("Segoe UI Semibold", 12),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        def refresh_row(key):
+            mods, vk = pending[key]
+            value_labels[key].configure(text=_hotkey_display(mods, vk))
+
+        def stop_recording(result):
+            key = recording["key"]
+            if key is None:
+                return
+            if recording["poll_job"] is not None:
+                root.after_cancel(recording["poll_job"])
+                recording["poll_job"] = None
+            if result is not None:
+                pending[key] = result
+                refresh_row(key)
+            change_buttons[key].configure(text="Change")
+            for btn in change_buttons.values():
+                btn.configure(state="normal")
+            recording["key"] = None
+            status_var.set("")
+
+        def poll():
+            key = recording["key"]
+            if key is None:
+                return
+            if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:  # Esc cancels
+                stop_recording(None)
+                return
+            mods = 0
+            if user32.GetAsyncKeyState(VK_CONTROL) & 0x8000:
+                mods |= MOD_CONTROL
+            if user32.GetAsyncKeyState(VK_MENU) & 0x8000:
+                mods |= MOD_ALT
+            if user32.GetAsyncKeyState(VK_SHIFT) & 0x8000:
+                mods |= MOD_SHIFT
+            if (user32.GetAsyncKeyState(VK_LWIN) & 0x8000) or (user32.GetAsyncKeyState(VK_RWIN) & 0x8000):
+                mods |= MOD_WIN
+            if mods:
+                for vk in range(0x08, 0xFF):
+                    if vk in _RECORD_IGNORE_VKS:
+                        continue
+                    if user32.GetAsyncKeyState(vk) & 0x8000:
+                        stop_recording((mods, vk))
+                        return
+            recording["poll_job"] = root.after(40, poll)
+
+        def start_recording(key):
+            if recording["key"] is not None:
+                return
+            recording["key"] = key
+            status_var.set("Hold Ctrl, Alt, Shift, and/or Win, then press a key. Esc to cancel.")
+            change_buttons[key].configure(text="Press keys...")
+            for k, btn in change_buttons.items():
+                if k != key:
+                    btn.configure(state="disabled")
+            poll()
+
+        rows_info = (("manager", "Open history manager"), ("quick", "Type most recent"))
+        for r, (key, label_text) in enumerate(rows_info, start=1):
+            tk.Label(
+                container,
+                text=label_text,
+                bg=BG_COLOR,
+                fg=TEXT_PRIMARY,
+                font=("Segoe UI", 10),
+                anchor="w",
+            ).grid(row=r, column=0, sticky="w", padx=(0, 14), pady=6)
+            lbl = tk.Label(
+                container,
+                text=_hotkey_display(*pending[key]),
+                bg=CHIP_BG,
+                fg=TEXT_PRIMARY,
+                font=("Segoe UI Semibold", 10),
+                padx=8,
+                pady=3,
+                width=16,
+            )
+            lbl.grid(row=r, column=1, sticky="w", padx=(0, 10))
+            value_labels[key] = lbl
+            btn = tk.Button(container, text="Change", width=12, command=lambda k=key: start_recording(k))
+            btn.grid(row=r, column=2, sticky="w")
+            change_buttons[key] = btn
+
+        tk.Label(
+            container, textvariable=status_var, bg=BG_COLOR, fg=TEXT_SECONDARY, font=("Segoe UI", 8),
+            wraplength=360, justify="left",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 10))
+
+        def close():
+            if recording["key"] is not None:
+                stop_recording(None)
+            root.destroy()
+
+        def do_reset():
+            pending["manager"] = (DEFAULT_MANAGER_HOTKEY_MODS, DEFAULT_MANAGER_HOTKEY_VK)
+            pending["quick"] = (DEFAULT_QUICK_TYPE_HOTKEY_MODS, DEFAULT_QUICK_TYPE_HOTKEY_VK)
+            refresh_row("manager")
+            refresh_row("quick")
+
+        row_labels = dict(rows_info)  # {"manager": "Open history manager", "quick": "Type most recent"}
+
+        def commit(final_values):
+            global manager_hotkey_mods, manager_hotkey_vk
+            global quick_type_hotkey_mods, quick_type_hotkey_vk
+            manager_hotkey_mods, manager_hotkey_vk = final_values["manager"]
+            quick_type_hotkey_mods, quick_type_hotkey_vk = final_values["quick"]
+            _set_reg_int("ManagerHotkeyMods", manager_hotkey_mods)
+            _set_reg_int("ManagerHotkeyVk", manager_hotkey_vk)
+            _set_reg_int("QuickTypeHotkeyMods", quick_type_hotkey_mods)
+            _set_reg_int("QuickTypeHotkeyVk", quick_type_hotkey_vk)
+            restart_hotkey_listener()
+            messagebox.showinfo(APP_TITLE, "Shortcuts saved.", parent=root)
+            close()
+
+        def show_conflict_dialog(conflicts, candidates, current):
+            # `conflicts` holds only the shortcut(s) that are actually taken
+            # by another app; the other one (if any) is already known-good
+            # and doesn't need to be thrown away just because its sibling
+            # collided with something.
+            dlg = tk.Toplevel(root)
+            dlg.title("Shortcut already in use")
+            dlg.configure(bg=BG_COLOR)
+            dlg.resizable(False, False)
+            dlg.transient(root)
+            dlg.attributes("-topmost", True)
+            dlg.grab_set()
+
+            body = tk.Frame(dlg, bg=BG_COLOR, padx=18, pady=16)
+            body.pack(fill=tk.BOTH, expand=True)
+
+            lines = [
+                f"• {row_labels[key]}: ‘{_hotkey_display(mods, vk)}’ is already "
+                f"used by another running app."
+                for key, (mods, vk) in conflicts.items()
+            ]
+            tk.Label(
+                body,
+                text="\n".join(lines),
+                bg=BG_COLOR,
+                fg=TEXT_PRIMARY,
+                font=("Segoe UI", 10),
+                justify="left",
+                wraplength=380,
+            ).pack(anchor="w", pady=(0, 14))
+
+            button_col = tk.Frame(body, bg=BG_COLOR)
+            button_col.pack(fill=tk.X)
+
+            def do_retry():
+                dlg.destroy()
+                # Send just the conflicting row(s) back into recording mode
+                # so the user can immediately pick something else, without
+                # having to redo whichever shortcut (if any) was already fine.
+                for key in conflicts:
+                    start_recording(key)
+
+            def do_cancel_all():
+                dlg.destroy()
+
+            if len(conflicts) == 1:
+                (conflict_key,) = conflicts.keys()
+                ok_key = next(k for k in candidates if k != conflict_key)
+
+                def do_save_partial():
+                    dlg.destroy()
+                    # Keep the shortcut that's free, revert the conflicting
+                    # one back to whatever it's currently, successfully
+                    # bound to - never left half-configured or unbound.
+                    final_values = dict(candidates)
+                    final_values[conflict_key] = current[conflict_key]
+                    pending[conflict_key] = current[conflict_key]
+                    refresh_row(conflict_key)
+                    commit(final_values)
+
+                tk.Button(
+                    button_col,
+                    text=(
+                        f"Save “{row_labels[ok_key]}”, keep “{row_labels[conflict_key]}” "
+                        f"as {_hotkey_display(*current[conflict_key])}"
+                    ),
+                    wraplength=360,
+                    justify="left",
+                    command=do_save_partial,
+                ).pack(fill=tk.X, pady=(0, 6))
+                tk.Button(
+                    button_col,
+                    text=f"Pick a different shortcut for “{row_labels[conflict_key]}”",
+                    command=do_retry,
+                ).pack(fill=tk.X, pady=(0, 6))
+            else:
+                tk.Button(
+                    button_col, text="Pick different shortcuts for both", command=do_retry
+                ).pack(fill=tk.X, pady=(0, 6))
+
+            tk.Button(button_col, text="Cancel (keep current shortcuts)", command=do_cancel_all).pack(
+                fill=tk.X
+            )
+
+            dlg.update_idletasks()
+            w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+            rx, ry = root.winfo_x(), root.winfo_y()
+            rw, rh = root.winfo_width(), root.winfo_height()
+            dlg.geometry(f"{w}x{h}+{rx + (rw - w) // 2}+{ry + (rh - h) // 2}")
+            dlg.after(10, dlg.focus_force)
+
+        def do_save():
+            m_mods, m_vk = pending["manager"]
+            q_mods, q_vk = pending["quick"]
+            if (m_mods, m_vk) == (q_mods, q_vk):
+                messagebox.showerror(
+                    APP_TITLE,
+                    "The two shortcuts can't be identical - pick a different "
+                    "combination for each.",
+                    parent=root,
+                )
+                return
+
+            candidates = {"manager": (m_mods, m_vk), "quick": (q_mods, q_vk)}
+            current = {
+                "manager": (manager_hotkey_mods, manager_hotkey_vk),
+                "quick": (quick_type_hotkey_mods, quick_type_hotkey_vk),
+            }
+            conflicts = {}
+            for key, combo in candidates.items():
+                if combo == current[key]:
+                    continue  # unchanged - already registered by this app, nothing to test
+                mods, vk = combo
+                ok = user32.RegisterHotKey(None, _HOTKEY_TEST_ID, mods | MOD_NOREPEAT, vk)
+                if ok:
+                    user32.UnregisterHotKey(None, _HOTKEY_TEST_ID)
+                else:
+                    conflicts[key] = combo
+
+            if conflicts:
+                show_conflict_dialog(conflicts, candidates, current)
+            else:
+                commit(candidates)
+
+        button_row = tk.Frame(container, bg=BG_COLOR)
+        button_row.grid(row=4, column=0, columnspan=3, sticky="e", pady=(4, 0))
+        tk.Button(button_row, text="Reset to defaults", command=do_reset).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(button_row, text="Cancel", command=close).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(button_row, text="Save", command=do_save).pack(side=tk.LEFT)
+
+        root.protocol("WM_DELETE_WINDOW", close)
+        root.update_idletasks()
+        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        root.lift()
+        root.after(10, root.focus_force)
+        root.mainloop()
+
+    threading.Thread(target=build_ui, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # System tray icon
 # ---------------------------------------------------------------------------
 def _make_icon_image():
@@ -1205,6 +1700,12 @@ def toggle_always_running(icon, item):
     _set_setting("AlwaysRunning", always_running_enabled)
 
 
+def toggle_esc_cancels_typing(icon, item):
+    global esc_cancels_typing_enabled
+    esc_cancels_typing_enabled = not esc_cancels_typing_enabled
+    _set_setting("EscCancelsTyping", esc_cancels_typing_enabled)
+
+
 def quit_app(icon, item):
     icon.stop()
     _release_instance_mutex()
@@ -1212,44 +1713,60 @@ def quit_app(icon, item):
     os._exit(0)
 
 
-def run_tray():
+def _build_tray_menu_items():
+    # A callable (rather than a static tuple) so pystray re-evaluates it
+    # every time the menu is about to be shown - that's what lets the two
+    # shortcut labels and the elevation status stay current after the user
+    # changes them, without having to rebuild/restart the whole tray icon.
     elevation_label = (
         "Running as Administrator"
         if _is_elevated()
         else "Restart as Administrator (for admin app credential boxes)"
     )
+    manager_label = f"Open history manager ({_hotkey_display(manager_hotkey_mods, manager_hotkey_vk)})"
+    quick_label = f"Type most recent ({_hotkey_display(quick_type_hotkey_mods, quick_type_hotkey_vk)})"
+    return (
+        pystray.MenuItem(manager_label, lambda icon, item: open_manager()),
+        pystray.MenuItem(quick_label, lambda icon, item: quick_type_latest()),
+        pystray.MenuItem(
+            "Monitoring enabled",
+            toggle_monitoring,
+            checked=lambda item: monitoring_enabled,
+        ),
+        pystray.MenuItem("Clear history", clear_history),
+        pystray.MenuItem("Customize shortcuts...", lambda icon, item: open_hotkey_settings()),
+        pystray.MenuItem(
+            "Cancel typing by pressing Esc",
+            toggle_esc_cancels_typing,
+            checked=lambda item: esc_cancels_typing_enabled,
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            elevation_label,
+            relaunch_elevated,
+            enabled=not _is_elevated(),
+        ),
+        pystray.MenuItem(
+            "Always running (auto-restart if it crashes)",
+            toggle_always_running,
+            checked=lambda item: always_running_enabled,
+        ),
+        pystray.MenuItem(
+            "Run at startup",
+            toggle_run_at_startup,
+            checked=lambda item: run_at_startup_enabled,
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit", quit_app),
+    )
+
+
+def run_tray():
     icon = pystray.Icon(
         "clipboard_typer",
         _make_icon_image(),
         "Clipboard Typer",
-        menu=pystray.Menu(
-            pystray.MenuItem("Open history manager (Win+Alt+V)", lambda icon, item: open_manager()),
-            pystray.MenuItem("Type most recent (Ctrl+Alt+V)", lambda icon, item: quick_type_latest()),
-            pystray.MenuItem(
-                "Monitoring enabled",
-                toggle_monitoring,
-                checked=lambda item: monitoring_enabled,
-            ),
-            pystray.MenuItem("Clear history", clear_history),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                elevation_label,
-                relaunch_elevated,
-                enabled=not _is_elevated(),
-            ),
-            pystray.MenuItem(
-                "Always running (auto-restart if it crashes)",
-                toggle_always_running,
-                checked=lambda item: always_running_enabled,
-            ),
-            pystray.MenuItem(
-                "Run at startup",
-                toggle_run_at_startup,
-                checked=lambda item: run_at_startup_enabled,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", quit_app),
-        ),
+        menu=pystray.Menu(_build_tray_menu_items),
     )
     icon.run()
 
@@ -1289,7 +1806,7 @@ def main():
 
     threading.Thread(target=monitor_clipboard, daemon=True, name="ClipboardMonitor").start()
 
-    _register_hotkeys()
+    _start_hotkey_listener()
 
     run_tray()  # blocks until Quit is chosen
 
