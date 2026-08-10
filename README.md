@@ -104,13 +104,31 @@ conflicting second instance.
 
 ## Run automatically at startup
 
-The easiest way is the tray menu's **"Run at startup"** checkbox — it adds
-(or removes) a `HKEY_CURRENT_USER\...\CurrentVersion\Run` registry entry
-pointing at the current install (the frozen `.exe` if you're running the
-packaged build, or `pythonw.exe clipboard_typer.py` otherwise). No admin
-rights needed, since it's a per-user registry key.
+The easiest way is the tray menu's **"Run at startup"** checkbox. What it
+actually does depends on how you installed the app, and the app detects
+this automatically:
 
-You can also do it manually:
+- **Installed from the Microsoft Store (MSIX):** toggling it calls
+  Windows' own `StartupTask` API, the same mechanism every other Store app
+  uses to run at logon — it also shows up under **Settings > Apps >
+  Startup**, where you can turn it off from Windows' side too. A classic
+  registry `Run` key entry does *not* work for a Store-installed app —
+  Windows silently virtualizes/ignores writes to it for packaged apps, so
+  the entry would look like it saved successfully but the app would never
+  actually launch at the next reboot. If you toggled this on in an earlier
+  version and it didn't survive a reboot, that registry-key limitation was
+  why; this is now fixed by using the proper API instead. If you ever turn
+  it off from Windows Settings directly, note the app can't silently turn
+  it back on for you afterwards — you'd need to re-enable it from Settings
+  yourself, or from the tray checkbox, which will tell you if that's the
+  case.
+- **Running the plain script or a standalone (non-Store) `.exe`:** toggling
+  it adds/removes a normal `HKEY_CURRENT_USER\...\CurrentVersion\Run`
+  registry entry pointing at the current install (the frozen `.exe`, or
+  `pythonw.exe clipboard_typer.py`). No admin rights needed either way,
+  since it's a per-user registry key.
+
+You can also do it manually (unpackaged installs only):
 
 1. Press `Win+R`, type `shell:startup`, hit Enter.
 2. Create a shortcut in that folder pointing to:

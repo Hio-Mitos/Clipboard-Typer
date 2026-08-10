@@ -5,6 +5,22 @@ All notable changes to Clipboard Typer are recorded here, one entry per
 see the note at the bottom for where the *user*-facing "what's new" text
 for each release lives.
 
+## 1.3.0.0
+
+### Fixed
+- **"Run at startup" not actually starting the app after a reboot**, for
+  the Microsoft Store (MSIX) install. Root cause: packaged/Desktop Bridge
+  apps can't use the classic `HKCU ...\CurrentVersion\Run` registry key -
+  Windows virtualizes/ignores writes to it for MSIX apps, so the entry
+  appeared to save successfully but was never actually launched at logon.
+  Fixed by adding the `windows.startupTask` extension to
+  `AppxManifest.xml` and switching the toggle, on packaged installs, to
+  Windows' own `Windows.ApplicationModel.StartupTask` WinRT API (via the
+  new `winsdk` dependency) - the same mechanism every other Store app
+  uses, which also shows up under Settings > Apps > Startup. The
+  unpackaged (plain script / standalone EXE) distribution is unaffected
+  and continues using the classic registry key, which works fine there.
+
 ## 1.2.0.0
 
 ### Fixed

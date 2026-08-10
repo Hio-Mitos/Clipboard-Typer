@@ -8,13 +8,23 @@
 # Build with:
 #     pyinstaller clipboard_typer.spec
 
+from PyInstaller.utils.hooks import collect_all
+
 block_cipher = None
+
+# winsdk (the Windows Runtime / WinRT Python bindings, used for the
+# "Run at startup" feature's StartupTask API on the packaged/MSIX build)
+# ships its own native extension modules and WinMD metadata that
+# PyInstaller's static import scanner can't see on its own - collect_all()
+# pulls in everything the package needs (binaries, data files, and every
+# submodule it might import) rather than hand-listing them one by one.
+winsdk_datas, winsdk_binaries, winsdk_hiddenimports = collect_all('winsdk')
 
 a = Analysis(
     ['clipboard_typer.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=winsdk_binaries,
+    datas=winsdk_datas,
     # pywin32 modules are sometimes missed by PyInstaller's automatic
     # dependency scan - list them explicitly so the frozen EXE doesn't fail
     # at runtime with "DLL load failed" / ImportError.
@@ -26,7 +36,7 @@ a = Analysis(
         'win32api',
         'win32event',
         'winerror',
-    ],
+    ] + winsdk_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -107,6 +107,7 @@ SINGLE_INSTANCE_MUTEX_NAME = r"Global\ClipboardTyperSingleInstanceMutex"
 SETTINGS_REG_PATH = r"Software\ClipboardTyper"
 STARTUP_RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_RUN_VALUE_NAME = "ClipboardTyper"
+STARTUP_TASK_ID = "ClipboardTyperStartupTask"  # must match AppxManifest.xml's <desktop:StartupTask TaskId=...>
 
 # "Always Running" = auto-restart the app if it crashes. To avoid spinning
 # forever on a crash that happens instantly every time (a real, unfixable
@@ -287,11 +288,59 @@ def _load_persisted_settings():
 
 
 # ---------------------------------------------------------------------------
-# Run at startup (HKCU ...\CurrentVersion\Run)
+# Run at startup
+#
+# Packaged (MSIX/Desktop Bridge - i.e. the Microsoft Store install) and
+# unpackaged (plain clipboard_typer.py / standalone EXE) builds need two
+# completely different mechanisms here:
+#   - Unpackaged: the classic HKCU ...\CurrentVersion\Run registry key,
+#     which is what a normal Win32 app has always used.
+#   - Packaged: Windows silently virtualizes/ignores writes to that same
+#     Run key for MSIX apps, so an entry there is never actually launched
+#     at logon even though the registry write itself succeeds with no
+#     error - this was reported as "Run at startup doesn't actually start
+#     the app after a reboot" and is exactly why. The OS-sanctioned
+#     replacement is the windows.startupTask extension declared in
+#     AppxManifest.xml, toggled at runtime via the WinRT
+#     Windows.ApplicationModel.StartupTask API (through the `winsdk`
+#     package) - this is also what makes the toggle show up under
+#     Settings > Apps > Startup, same as any other Store app.
 # ---------------------------------------------------------------------------
+ctypes.windll.kernel32.GetCurrentPackageFullName.argtypes = [
+    ctypes.POINTER(wintypes.UINT), ctypes.c_wchar_p
+]
+ctypes.windll.kernel32.GetCurrentPackageFullName.restype = ctypes.c_long
+_APPMODEL_ERROR_NO_PACKAGE = 15700
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+
+def _get_current_package_full_name():
+    """This process's MSIX package full name, or None if running
+    unpackaged (plain script / standalone EXE rather than the
+    Store-installed package)."""
+    try:
+        length = wintypes.UINT(0)
+        result = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
+        if result == _APPMODEL_ERROR_NO_PACKAGE:
+            return None
+        if result != _ERROR_INSUFFICIENT_BUFFER or length.value == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(length.value)
+        result = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), buf)
+        return buf.value if result == 0 else None
+    except Exception:
+        return None
+
+
+_IS_PACKAGED_APP = _get_current_package_full_name() is not None
+
+
 def _self_launch_command():
     """The exact command line that relaunches this app, whether it's running
-    as a frozen PyInstaller .exe or as a plain .py script."""
+    as a frozen PyInstaller .exe or as a plain .py script. Only used for the
+    unpackaged (classic Run key) path - the packaged path doesn't need this,
+    since Windows already knows how to relaunch the app from the StartupTask
+    declaration in AppxManifest.xml."""
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}"'
     script_path = os.path.abspath(__file__)
@@ -303,7 +352,62 @@ def _self_launch_command():
     return f'"{interpreter}" "{script_path}"'
 
 
+def _startup_task_state():
+    """Current WinRT StartupTaskState for the packaged app, or None if
+    unpackaged or if the query fails for any reason (e.g. winsdk isn't
+    available in this build - degrade quietly rather than crash startup)."""
+    if not _IS_PACKAGED_APP:
+        return None
+    try:
+        import asyncio
+        from winsdk.windows.applicationmodel import StartupTask
+
+        task = asyncio.run(StartupTask.get_async(STARTUP_TASK_ID))
+        return task.state
+    except Exception:
+        return None
+
+
+def _startup_task_request_enable():
+    """Ask Windows to enable the startup task. Returns the resulting state,
+    or None on failure. The first time this is called, Windows may show its
+    own brief system prompt; after a user disables it from Settings, this
+    call can no longer silently re-enable it (see DISABLED_BY_USER handling
+    in _set_run_at_startup)."""
+    if not _IS_PACKAGED_APP:
+        return None
+    try:
+        import asyncio
+        from winsdk.windows.applicationmodel import StartupTask
+
+        task = asyncio.run(StartupTask.get_async(STARTUP_TASK_ID))
+        return asyncio.run(task.request_enable_async())
+    except Exception:
+        return None
+
+
+def _startup_task_disable():
+    if not _IS_PACKAGED_APP:
+        return
+    try:
+        import asyncio
+        from winsdk.windows.applicationmodel import StartupTask
+
+        task = asyncio.run(StartupTask.get_async(STARTUP_TASK_ID))
+        task.disable()
+    except Exception:
+        pass
+
+
 def _startup_shortcut_exists():
+    if _IS_PACKAGED_APP:
+        try:
+            from winsdk.windows.applicationmodel import StartupTaskState
+
+            state = _startup_task_state()
+            return state in (StartupTaskState.ENABLED, StartupTaskState.ENABLED_BY_POLICY)
+        except Exception:
+            return False
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY_PATH) as key:
             winreg.QueryValueEx(key, STARTUP_RUN_VALUE_NAME)
@@ -314,6 +418,53 @@ def _startup_shortcut_exists():
 
 def _set_run_at_startup(enabled):
     global run_at_startup_enabled
+
+    if _IS_PACKAGED_APP:
+        try:
+            from winsdk.windows.applicationmodel import StartupTaskState
+        except Exception as exc:
+            _show_error_box(
+                f"{APP_TITLE} - startup toggle unavailable",
+                f"Couldn't access Windows' startup task API in this build.\n\nDetails: {exc}",
+            )
+            return
+        if enabled:
+            new_state = _startup_task_request_enable()
+            if new_state == StartupTaskState.DISABLED_BY_USER:
+                _show_error_box(
+                    f"{APP_TITLE} - can't enable automatically",
+                    "Windows shows this app's startup entry as turned off at "
+                    "the system level, so it can't be re-enabled from here. "
+                    "Turn it back on from Settings > Apps > Startup instead.",
+                )
+                run_at_startup_enabled = False
+                return
+            if new_state == StartupTaskState.DISABLED_BY_POLICY:
+                _show_error_box(
+                    f"{APP_TITLE} - blocked by policy",
+                    "Your organization's Windows policy prevents apps from "
+                    "running at startup. Contact your administrator if you "
+                    "need this enabled.",
+                )
+                run_at_startup_enabled = False
+                return
+            if new_state is None:
+                _show_error_box(
+                    f"{APP_TITLE} - couldn't update startup setting",
+                    "Could not change the 'Run at startup' setting.",
+                )
+                run_at_startup_enabled = False
+                return
+            run_at_startup_enabled = new_state in (
+                StartupTaskState.ENABLED,
+                StartupTaskState.ENABLED_BY_POLICY,
+            )
+        else:
+            _startup_task_disable()
+            run_at_startup_enabled = False
+        return
+
+    # Unpackaged (plain script / standalone EXE) build: classic Run key.
     try:
         key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY_PATH)
         with key:
