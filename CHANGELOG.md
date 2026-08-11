@@ -21,6 +21,14 @@ for each release lives.
   unpackaged (plain script / standalone EXE) distribution is unaffected
   and continues using the classic registry key, which works fine there.
 
+### Added
+- If a packaged install's "Run at startup" is blocked because someone
+  turned it off directly from Task Manager's Startup apps tab or from
+  Settings, the tray menu now says so in the item's own label (rather than
+  a silently unchecked box with no explanation), and offers to open
+  Windows Settings' Startup Apps page directly instead of just describing
+  where it is.
+
 ## 1.2.0.0
 
 ### Fixed

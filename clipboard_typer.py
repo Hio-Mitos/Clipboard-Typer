@@ -32,6 +32,7 @@ Run:
     python.exe clipboard_typer.py       (with console, useful for debugging)
 """
 
+import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
 import os
@@ -159,6 +160,32 @@ def _show_error_box(title, message):
     try:
         # MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND
         ctypes.windll.user32.MessageBoxW(0, message, title, 0x00000010 | 0x00040000 | 0x00010000)
+    except Exception:
+        pass
+
+
+def _show_confirm_box(title, message):
+    """Yes/No prompt using the same plain ctypes MessageBoxW as
+    _show_error_box (rather than tkinter's messagebox), so it's safe to call
+    from any thread - including the pystray tray-icon callback thread, which
+    has no Tk mainloop running on it."""
+    try:
+        MB_YESNO = 0x00000004
+        MB_ICONQUESTION = 0x00000020
+        MB_TOPMOST = 0x00040000
+        MB_SETFOREGROUND = 0x00010000
+        IDYES = 6
+        result = ctypes.windll.user32.MessageBoxW(
+            0, message, title, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND
+        )
+        return result == IDYES
+    except Exception:
+        return False
+
+
+def _open_windows_startup_settings():
+    try:
+        os.startfile("ms-settings:startupapps")
     except Exception:
         pass
 
@@ -352,51 +379,96 @@ def _self_launch_command():
     return f'"{interpreter}" "{script_path}"'
 
 
+_startup_task_last_error = None  # human-readable text from the most recent
+                                  # StartupTask call, if it failed - surfaced
+                                  # in the error box instead of a generic
+                                  # "couldn't change it" message with no detail.
+
+
+def _run_winrt_async(awaitable):
+    """winsdk's WinRT async calls (GetAsync, RequestEnableAsync, ...) return
+    an IAsyncOperation - it's *awaitable* (has __await__), but it isn't a
+    Python coroutine object, and asyncio.run() specifically requires the
+    latter ("a coroutine was expected"). Wrapping the await in a real
+    async def first gives asyncio.run() an actual coroutine to drive, which
+    then awaits the WinRT object correctly underneath."""
+    async def _runner():
+        return await awaitable
+
+    return asyncio.run(_runner())
+
+
 def _startup_task_state():
     """Current WinRT StartupTaskState for the packaged app, or None if
-    unpackaged or if the query fails for any reason (e.g. winsdk isn't
-    available in this build - degrade quietly rather than crash startup)."""
+    unpackaged or if the query fails for any reason."""
+    global _startup_task_last_error
     if not _IS_PACKAGED_APP:
         return None
     try:
-        import asyncio
         from winsdk.windows.applicationmodel import StartupTask
 
-        task = asyncio.run(StartupTask.get_async(STARTUP_TASK_ID))
+        task = _run_winrt_async(StartupTask.get_async(STARTUP_TASK_ID))
+        _startup_task_last_error = None
         return task.state
-    except Exception:
+    except Exception as exc:
+        _startup_task_last_error = f"{type(exc).__name__}: {exc}"
         return None
 
 
 def _startup_task_request_enable():
     """Ask Windows to enable the startup task. Returns the resulting state,
-    or None on failure. The first time this is called, Windows may show its
-    own brief system prompt; after a user disables it from Settings, this
-    call can no longer silently re-enable it (see DISABLED_BY_USER handling
-    in _set_run_at_startup)."""
+    or None on failure (see _startup_task_last_error for why). The first
+    time this is called, Windows may show its own brief system prompt;
+    after a user disables it from Settings, this call can no longer
+    silently re-enable it (see DISABLED_BY_USER handling in
+    _set_run_at_startup)."""
+    global _startup_task_last_error
     if not _IS_PACKAGED_APP:
         return None
     try:
-        import asyncio
         from winsdk.windows.applicationmodel import StartupTask
 
-        task = asyncio.run(StartupTask.get_async(STARTUP_TASK_ID))
-        return asyncio.run(task.request_enable_async())
-    except Exception:
+        task = _run_winrt_async(StartupTask.get_async(STARTUP_TASK_ID))
+        result = _run_winrt_async(task.request_enable_async())
+        _startup_task_last_error = None
+        return result
+    except Exception as exc:
+        _startup_task_last_error = f"{type(exc).__name__}: {exc}"
         return None
 
 
 def _startup_task_disable():
+    global _startup_task_last_error
     if not _IS_PACKAGED_APP:
         return
     try:
-        import asyncio
         from winsdk.windows.applicationmodel import StartupTask
 
-        task = asyncio.run(StartupTask.get_async(STARTUP_TASK_ID))
+        task = _run_winrt_async(StartupTask.get_async(STARTUP_TASK_ID))
         task.disable()
-    except Exception:
-        pass
+        _startup_task_last_error = None
+    except Exception as exc:
+        _startup_task_last_error = f"{type(exc).__name__}: {exc}"
+
+
+def _startup_menu_label():
+    """Tray menu text for the "Run at startup" item. Usually just the plain
+    label, but if a packaged install's startup task has been blocked from
+    outside the app (Task Manager's Startup apps tab, Settings, or an org
+    policy), say so right in the menu rather than leaving the checkbox
+    quietly unchecked with no explanation."""
+    if _IS_PACKAGED_APP:
+        try:
+            from winsdk.windows.applicationmodel import StartupTaskState
+
+            state = _startup_task_state()
+            if state == StartupTaskState.DISABLED_BY_USER:
+                return "Run at startup (blocked in Windows Settings)"
+            if state == StartupTaskState.DISABLED_BY_POLICY:
+                return "Run at startup (blocked by policy)"
+        except Exception:
+            pass
+    return "Run at startup"
 
 
 def _startup_shortcut_exists():
@@ -431,12 +503,21 @@ def _set_run_at_startup(enabled):
         if enabled:
             new_state = _startup_task_request_enable()
             if new_state == StartupTaskState.DISABLED_BY_USER:
-                _show_error_box(
+                # Someone turned this off from Task Manager's "Startup apps"
+                # tab or from Settings directly - Windows treats that as an
+                # explicit user decision, and RequestEnableAsync can't
+                # silently override it from here. Offer to jump straight to
+                # the Settings page instead of just describing where it is.
+                open_it = _show_confirm_box(
                     f"{APP_TITLE} - can't enable automatically",
                     "Windows shows this app's startup entry as turned off at "
-                    "the system level, so it can't be re-enabled from here. "
-                    "Turn it back on from Settings > Apps > Startup instead.",
+                    "the system level (from Task Manager or Settings), so it "
+                    "can't be re-enabled from here.\n\n"
+                    "Open Windows Settings' Startup Apps page now to turn it "
+                    "back on?",
                 )
+                if open_it:
+                    _open_windows_startup_settings()
                 run_at_startup_enabled = False
                 return
             if new_state == StartupTaskState.DISABLED_BY_POLICY:
@@ -449,9 +530,11 @@ def _set_run_at_startup(enabled):
                 run_at_startup_enabled = False
                 return
             if new_state is None:
+                detail = _startup_task_last_error or "No further details were reported."
                 _show_error_box(
                     f"{APP_TITLE} - couldn't update startup setting",
-                    "Could not change the 'Run at startup' setting.",
+                    "Could not change the 'Run at startup' setting.\n\n"
+                    f"Details: {detail}",
                 )
                 run_at_startup_enabled = False
                 return
@@ -1869,6 +1952,13 @@ def _build_tray_menu_items():
     # every time the menu is about to be shown - that's what lets the two
     # shortcut labels and the elevation status stay current after the user
     # changes them, without having to rebuild/restart the whole tray icon.
+    global run_at_startup_enabled
+    if _IS_PACKAGED_APP:
+        # Someone could have flipped this from Task Manager or Settings
+        # since the menu was last opened - re-check rather than trust
+        # whatever this process last set it to.
+        run_at_startup_enabled = _startup_shortcut_exists()
+    startup_label = _startup_menu_label()
     elevation_label = (
         "Running as Administrator"
         if _is_elevated()
@@ -1903,7 +1993,7 @@ def _build_tray_menu_items():
             checked=lambda item: always_running_enabled,
         ),
         pystray.MenuItem(
-            "Run at startup",
+            startup_label,
             toggle_run_at_startup,
             checked=lambda item: run_at_startup_enabled,
         ),

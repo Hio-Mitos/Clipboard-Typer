@@ -118,10 +118,11 @@ this automatically:
   actually launch at the next reboot. If you toggled this on in an earlier
   version and it didn't survive a reboot, that registry-key limitation was
   why; this is now fixed by using the proper API instead. If you ever turn
-  it off from Windows Settings directly, note the app can't silently turn
-  it back on for you afterwards — you'd need to re-enable it from Settings
-  yourself, or from the tray checkbox, which will tell you if that's the
-  case.
+  it off from Task Manager's Startup apps tab or Windows Settings directly,
+  the app can't silently turn it back on for you afterwards — the tray
+  menu's label will say "(blocked in Windows Settings)" in that case, and
+  clicking it offers to jump straight to Settings' Startup Apps page so you
+  can re-enable it there.
 - **Running the plain script or a standalone (non-Store) `.exe`:** toggling
   it adds/removes a normal `HKEY_CURRENT_USER\...\CurrentVersion\Run`
   registry entry pointing at the current install (the frozen `.exe`, or
