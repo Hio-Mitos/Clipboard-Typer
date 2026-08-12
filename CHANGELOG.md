@@ -22,6 +22,10 @@ for each release lives.
   and continues using the classic registry key, which works fine there.
 
 ### Added
+- Tray menu items now have small Unicode glyph prefixes (folder, keyboard,
+  trash, gear, shield, X) so actions are easier to scan at a glance.
+  Checkable items (Monitoring enabled, Cancel typing with Esc, Always
+  running, Run at startup) keep their plain OS-drawn checkmark instead.
 - If a packaged install's "Run at startup" is blocked because someone
   turned it off directly from Task Manager's Startup apps tab or from
   Settings, the tray menu now says so in the item's own label (rather than

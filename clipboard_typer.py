@@ -1960,12 +1960,19 @@ def _build_tray_menu_items():
         run_at_startup_enabled = _startup_shortcut_exists()
     startup_label = _startup_menu_label()
     elevation_label = (
-        "Running as Administrator"
+        "\U0001F6E1 Running as Administrator"
         if _is_elevated()
-        else "Restart as Administrator (for admin app credential boxes)"
+        else "\U0001F6E1 Restart as Administrator (for admin app credential boxes)"
     )
-    manager_label = f"Open history manager ({_hotkey_display(manager_hotkey_mods, manager_hotkey_vk)})"
-    quick_label = f"Type most recent ({_hotkey_display(quick_type_hotkey_mods, quick_type_hotkey_vk)})"
+    manager_label = f"\U0001F4C1 Open history manager ({_hotkey_display(manager_hotkey_mods, manager_hotkey_vk)})"
+    quick_label = f"⌨ Type most recent ({_hotkey_display(quick_type_hotkey_mods, quick_type_hotkey_vk)})"
+    # pystray doesn't support real per-item icon bitmaps (only text, plus a
+    # native OS checkmark on checkable items) - these are plain Unicode
+    # glyphs prepended to the label text, a lightweight way to give each
+    # action a visual cue without replacing the whole tray/menu subsystem
+    # with a hand-built native Win32 popup menu. Checkable items (the ones
+    # below with `checked=`) intentionally have no glyph prefix, since the
+    # OS already draws a checkmark for those.
     return (
         pystray.MenuItem(manager_label, lambda icon, item: open_manager()),
         pystray.MenuItem(quick_label, lambda icon, item: quick_type_latest()),
@@ -1974,8 +1981,8 @@ def _build_tray_menu_items():
             toggle_monitoring,
             checked=lambda item: monitoring_enabled,
         ),
-        pystray.MenuItem("Clear history", clear_history),
-        pystray.MenuItem("Customize shortcuts...", lambda icon, item: open_hotkey_settings()),
+        pystray.MenuItem("\U0001F5D1 Clear history", clear_history),
+        pystray.MenuItem("⚙ Customize shortcuts...", lambda icon, item: open_hotkey_settings()),
         pystray.MenuItem(
             "Cancel typing by pressing Esc",
             toggle_esc_cancels_typing,
@@ -1998,7 +2005,7 @@ def _build_tray_menu_items():
             checked=lambda item: run_at_startup_enabled,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit", quit_app),
+        pystray.MenuItem("✖ Quit", quit_app),
     )
 
 
