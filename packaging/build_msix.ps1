@@ -40,6 +40,11 @@
         app name (see README.md's MSIX/Store section). -Target Local works
         with no manifest changes at all.
 
+    Every -Target Store build is checked against packaging\.last_store_version
+    (a small tracked file recording the last version actually built for the
+    Store) and refuses to build if <Identity Version> hasn't changed since
+    then - see README.md's versioning policy for how much to bump it.
+
 .PARAMETER Version
     Overrides the <Identity Version="..."> in the staged AppxManifest.xml
     for this build, e.g. -Version 1.2.0.0. Optional - if omitted, the
@@ -221,6 +226,25 @@ if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out
 $versionMatch = [regex]::Match($manifestContent, '<Identity\b[^>]*?\bVersion="([\d\.]+)"')
 $effectiveVersion = if ($versionMatch.Success) { $versionMatch.Groups[1].Value } else { "unknown-version" }
 
+# Every Store build must carry a version different from the last one that
+# was actually built for the Store - Partner Center rejects a resubmission
+# that reuses a version it's already seen, and it's easy to forget to bump
+# <Identity Version="..."> after a round of code changes. packaging\
+# .last_store_version (tracked in git, so it's a shared record across
+# machines/sessions) remembers the last Store-target version built here;
+# -Target Local builds never touch it, since those aren't submissions.
+$lastStoreVersionFile = Join-Path $packagingDir ".last_store_version"
+if ($Target -eq 'Store' -and (Test-Path $lastStoreVersionFile)) {
+    $lastStoreVersion = (Get-Content $lastStoreVersionFile -Raw).Trim()
+    if ($lastStoreVersion -and $lastStoreVersion -eq $effectiveVersion) {
+        throw "AppxManifest.xml's <Identity Version=`"$effectiveVersion`"> matches the last version built for the " +
+              "Store (see packaging\.last_store_version). Partner Center rejects a resubmission that reuses a " +
+              "version it has already seen - bump <Identity Version> in AppxManifest.xml (or pass -Version) first. " +
+              "See README.md's versioning policy: small fixes bump the Build number, real enhancements bump Minor, " +
+              "and major/drastic changes bump Major."
+    }
+}
+
 $msixName = if ($Target -eq 'Local') {
     "ClipboardTyper-LocalTest-$effectiveVersion.msix"
 } else {
@@ -233,6 +257,11 @@ Write-Host "`n==> Packing $msixPath ..."
 if ($LASTEXITCODE -ne 0) { throw "makeappx failed (exit $LASTEXITCODE)." }
 
 Write-Host "`n==> Package created: $msixPath"
+
+if ($Target -eq 'Store') {
+    Set-Content -Path $lastStoreVersionFile -Value $effectiveVersion -Encoding UTF8 -NoNewline
+    Write-Host "==> Recorded $effectiveVersion as the last Store build version (packaging\.last_store_version) - commit this file so the record persists."
+}
 
 # --- 5. -Target Local: sign with a local test certificate --------------------
 if ($Target -eq 'Local') {

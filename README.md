@@ -379,4 +379,31 @@ anything that touches global input.
 
 Remember to bump `<Identity Version="...">` for every new submission —
 Partner Center rejects a resubmission that reuses a version it has already
-seen.
+seen. `build_msix.ps1` now enforces this itself for `-Target Store` builds
+(see below), so a forgotten bump fails the build loudly instead of failing
+certification later.
+
+### Versioning policy
+
+Version format is `Major.Minor.Build.0` (the last segment, Revision, must
+always stay `0`). How far to bump depends on how significant the change is:
+
+- **Build** (3rd number) — small fixes, polish, docs-only changes. e.g.
+  `1.3.0.0` → `1.3.1.0`.
+- **Minor** (2nd number, reset Build to 0) — real enhancements: a new
+  feature, a meaningful behavior change. e.g. `1.3.1.0` → `1.4.0.0`.
+- **Major** (1st number, reset Minor and Build to 0) — drastic changes: a
+  significant rework, a large set of features shipped together, or
+  anything that changes how the app fundamentally behaves. e.g.
+  `1.4.0.0` → `2.0.0.0`.
+
+Every version bump also gets a `CHANGELOG.md` entry and matching "What's
+new in this version" text for the Store listing (see the note at the
+bottom of `CHANGELOG.md`).
+
+`build_msix.ps1` enforces the "every Store build gets a new version" half
+of this automatically: it records the version of the last successful
+`-Target Store` build in `packaging\.last_store_version` (tracked in git),
+and refuses to build again for the Store with the same
+`<Identity Version>` still in `AppxManifest.xml`. `-Target Local` builds
+are unaffected, since those aren't submissions.
