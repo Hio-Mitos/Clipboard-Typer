@@ -401,6 +401,33 @@ Every version bump also gets a `CHANGELOG.md` entry and matching "What's
 new in this version" text for the Store listing (see the note at the
 bottom of `CHANGELOG.md`).
 
+**Bumping the version from the CLI:** pass `-Bump Build|Minor|Major` to
+`build_msix.ps1` and it computes the new version from whatever's
+currently in `AppxManifest.xml` and writes it straight back into that
+real, checked-in file (not just a copy used for the build) — so the
+version in the repo and the version in whatever gets packaged can never
+drift apart. You can also set an exact version with `-Version 1.4.0.0`
+instead, which persists the same way. Only pass one of the two.
+
+```powershell
+.\build_msix.ps1 -Bump Build            # small fix -> Store build
+.\build_msix.ps1 -Bump Minor             # new feature -> Store build
+.\build_msix.ps1 -Target Local -Bump Build   # bump + local test build
+.\build_msix.ps1 -Version 2.0.0.0        # set an exact version -> Store build
+.\build_msix.ps1                          # build with the version already in the manifest, unchanged
+```
+
+Remember to `git commit` `AppxManifest.xml` (and `.last_store_version`
+after a Store build) once you're happy with the result — the script
+writes the new version to disk but doesn't commit it for you.
+
+Note on the 4-segment `Major.Minor.Build.Revision` naming: some general
+references (e.g. semantic-versioning explainers) describe the 4th
+segment as a "hotfix" or "revision" number for very minor/internal
+changes. That doesn't apply here — Partner Center requires Revision to
+always be `0` for every Store submission, so this project only ever uses
+the first three segments and `-Bump` never touches the 4th.
+
 `build_msix.ps1` enforces the "every Store build gets a new version" half
 of this automatically: it records the version of the last successful
 `-Target Store` build in `packaging\.last_store_version` (tracked in git),
