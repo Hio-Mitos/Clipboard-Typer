@@ -45,6 +45,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import winreg
@@ -68,6 +69,7 @@ from tkinter import messagebox
 # Configuration
 # ---------------------------------------------------------------------------
 APP_TITLE = "Clipboard Typer"
+FEEDBACK_EMAIL = "Hio-Mitos@gladiators.city"  # bugs / issues / feedback - see _open_feedback_email()
 HISTORY_MAXLEN = 50              # keep last 50 copied text items, in memory only
 POLL_INTERVAL = 0.4              # seconds between clipboard checks
 
@@ -232,6 +234,32 @@ def _open_windows_startup_settings():
         pass
 
 
+def _open_feedback_email():
+    """Opens the user's default mail app with a new message addressed to
+    the feedback/bug-report mailbox, pre-filled with a subject line and a
+    couple of lines of context (app version, whether it's the Store build,
+    OS version) to save a round-trip of "what version are you on" -
+    never any clipboard content or personal data."""
+    try:
+        subject = f"{APP_TITLE} - feedback / bug report"
+        body = (
+            f"App version: {_get_app_version()}\n"
+            f"Install type: {'Microsoft Store' if _IS_PACKAGED_APP else 'standalone'}\n"
+            f"Windows version: {platform.platform()}\n\n"
+            "Describe what happened below:\n"
+        )
+        query = urllib.parse.urlencode({"subject": subject, "body": body}, quote_via=urllib.parse.quote)
+        os.startfile(f"mailto:{FEEDBACK_EMAIL}?{query}")
+    except Exception:
+        # No default mail client configured, or os.startfile failed for some
+        # other reason - fall back to just telling the user the address.
+        _show_error_box(
+            f"{APP_TITLE} - send feedback",
+            f"Couldn't open your email app automatically.\n\n"
+            f"You can email us directly at: {FEEDBACK_EMAIL}",
+        )
+
+
 def _format_exc(exc_type, exc_value, exc_tb, limit_chars=1200):
     text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     if len(text) > limit_chars:
@@ -254,6 +282,8 @@ def _thread_crash_handler(args):
         f"Task: {args.thread.name}\n"
         "The app is still running, but this feature may not work until you "
         "restart Clipboard Typer.\n\n"
+        f"If this keeps happening, please email {FEEDBACK_EMAIL} with what "
+        "you were doing when it happened.\n\n"
         f"Details:\n{details}",
     )
 
@@ -280,6 +310,8 @@ def _main_crash_handler(exc_type, exc_value, exc_tb):
             "Clipboard Typer hit an internal error and stopped, but "
             "'Always Running' is turned on, so it is relaunching itself "
             "automatically now.\n\n"
+            f"If this keeps happening, please email {FEEDBACK_EMAIL} with what "
+            "you were doing when it happened.\n\n"
             f"Details:\n{details}",
         )
     else:
@@ -299,6 +331,8 @@ def _main_crash_handler(exc_type, exc_value, exc_tb):
             "You'll need to start it again (from its shortcut, or by re-running "
             "clipboard_typer.py) to get the shortcuts working again."
             f"{extra}\n\n"
+            f"If this keeps happening, please email {FEEDBACK_EMAIL} with what "
+            "you were doing when it happened.\n\n"
             f"Details:\n{details}",
         )
     os._exit(1)
@@ -2320,6 +2354,8 @@ def _build_tray_menu_items():
             toggle_run_at_startup,
             checked=lambda item: run_at_startup_enabled,
         ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("✉ Send feedback / report a bug", lambda icon, item: _open_feedback_email()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("✖ Quit", quit_app),
     )

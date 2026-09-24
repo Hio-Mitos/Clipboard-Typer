@@ -270,6 +270,20 @@ privacy policy / Store listing disclosing this opt-in reporting, since
 undisclosed telemetry — even opt-in — is worth being upfront about for
 both users and any future Store re-certification.
 
+## Feedback / bug reports
+
+The tray menu's **"Send feedback / report a bug"** item opens the user's
+default email app with a new message pre-addressed to
+`Hio-Mitos@gladiators.city`, with the subject and a couple of context
+lines (app version, Store vs. standalone, Windows version) already filled
+in — never any clipboard content. If no default mail app is configured,
+it falls back to a message box showing the address directly.
+
+The three crash message boxes (see "If something crashes" above) also
+point to this same address, inviting the user to email in if a crash
+keeps recurring — a useful backstop alongside the opt-in telemetry above
+for users who don't turn that on.
+
 ## Using it across a Remote Desktop / Windows App session
 
 Typing now works when the target text box is inside a remote session

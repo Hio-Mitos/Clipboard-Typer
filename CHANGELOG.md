@@ -19,6 +19,11 @@ for each release lives.
   version, and a random locally-generated install ID. A reference server
   implementation (Flask ingest endpoint + SQLite + employee dashboard) is
   included in `backend_reference/telemetry_backend.py`.
+- **"Send feedback / report a bug" tray menu item** — opens the default
+  mail app with a new message pre-addressed to
+  `Hio-Mitos@gladiators.city`, subject and basic version/OS context
+  pre-filled. The three crash message boxes now also point to this
+  address for users who don't have diagnostic reporting turned on.
 
 ## 1.3.0.0
 
