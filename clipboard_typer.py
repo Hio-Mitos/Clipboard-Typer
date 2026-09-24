@@ -35,14 +35,21 @@ Run:
 import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
+import json
 import os
+import platform
+import re
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
+import uuid
 import winreg
 from collections import deque
+from datetime import datetime, timezone
 
 import pyperclip
 import win32api
@@ -121,6 +128,39 @@ MAX_FAST_CRASH_RESTARTS = 5
 CRASH_RESTART_RESET_AFTER_SECONDS = 30
 
 # ---------------------------------------------------------------------------
+# Diagnostics/telemetry (crash & install-failure reporting)
+#
+# Opt-in only - OFF by default (see telemetry_enabled below and the tray
+# menu's "Send crash & diagnostic reports" toggle). When enabled, crash
+# reports - and, best-effort, MSIX install/update failures, see
+# _check_install_deployment_failures() - are written to a small local queue
+# and later POSTed to your own dashboard's ingest endpoint. This exists
+# because Partner Center's built-in crash insights don't include a
+# traceback or enough detail to actually debug from.
+#
+# Never included: clipboard content, or anything the user typed/copied.
+# Only error metadata is ever sent - exception type/message, a traceback,
+# app version, OS version, and a random per-install ID (generated locally,
+# not derived from any hardware identifier).
+#
+# IMPORTANT before shipping: set TELEMETRY_ENDPOINT_URL to your real
+# ingest endpoint, and TELEMETRY_API_KEY to a *write-only* ingest key (it
+# should only be able to create new reports, never read them back) - see
+# README's "Diagnostics / telemetry" section and backend_reference/ for a
+# starter server implementation. Because this key ships inside a
+# distributed EXE, treat it as visible to anyone who unpacks the build,
+# not as a real secret - it's a rate-limiting/abuse-prevention token, not
+# an access-control one.
+# ---------------------------------------------------------------------------
+TELEMETRY_ENDPOINT_URL = "https://YOUR-WEBSITE.example.com/api/telemetry"  # TODO: set before shipping
+TELEMETRY_API_KEY = "REPLACE_WITH_A_WRITE_ONLY_INGEST_KEY"                 # TODO: set before shipping
+TELEMETRY_TIMEOUT_SECONDS = 6
+TELEMETRY_MAX_QUEUE_AGE_DAYS = 30   # drop a queued report if it's been stuck this long (server unreachable)
+TELEMETRY_MAX_QUEUE_FILES = 200     # cap so an extended outage can't grow the queue folder unbounded
+APP_VERSION_FALLBACK = "1.3.0.0"    # unpackaged/dev builds only - bump by hand alongside AppxManifest.xml;
+                                     # packaged (Store) installs read their real version from the package itself
+
+# ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
 history = deque(maxlen=HISTORY_MAXLEN)
@@ -145,6 +185,8 @@ always_running_enabled = True
 run_at_startup_enabled = False
 esc_cancels_typing_enabled = True  # optional: Esc stops an in-progress typing burst
 _crash_restart_recovered = False  # flips true after CRASH_RESTART_RESET_AFTER_SECONDS of uptime
+telemetry_enabled = False  # opt-in crash/diagnostic reporting - see "Diagnostics/telemetry" above
+_telemetry_device_id = None  # cached after first read/generation - see _get_device_id()
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +243,10 @@ def _thread_crash_handler(args):
     """Installed as threading.excepthook: catches crashes in any background
     thread (clipboard monitor, typing bursts, the hotkey listener, ...)."""
     details = _format_exc(args.exc_type, args.exc_value, args.exc_traceback)
+    _queue_telemetry_report(_build_crash_report(
+        "crash", args.exc_type, args.exc_value, args.exc_traceback,
+        context=f"background_thread:{args.thread.name}",
+    ))
     _show_error_box(
         f"{APP_TITLE} - background task crashed",
         "A background task in Clipboard Typer stopped unexpectedly because of "
@@ -224,6 +270,7 @@ def _main_crash_handler(exc_type, exc_value, exc_tb):
         sys.__excepthook__(exc_type, exc_value, exc_tb)
         return
     details = _format_exc(exc_type, exc_value, exc_tb)
+    _queue_telemetry_report(_build_crash_report("crash", exc_type, exc_value, exc_tb, context="main_thread"))
 
     restarted = _attempt_crash_restart()
 
@@ -302,9 +349,28 @@ def _set_reg_int(name, value):
         pass
 
 
+def _get_reg_str(name, default=None):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SETTINGS_REG_PATH) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return str(value)
+    except OSError:
+        return default
+
+
+def _set_reg_str(name, value):
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, SETTINGS_REG_PATH)
+        with key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(value))
+    except OSError:
+        pass
+
+
 def _load_persisted_settings():
     global always_running_enabled, run_at_startup_enabled, esc_cancels_typing_enabled
     global manager_hotkey_mods, manager_hotkey_vk, quick_type_hotkey_mods, quick_type_hotkey_vk
+    global telemetry_enabled
     always_running_enabled = _get_setting("AlwaysRunning", True)
     run_at_startup_enabled = _startup_shortcut_exists()
     esc_cancels_typing_enabled = _get_setting("EscCancelsTyping", True)
@@ -312,6 +378,239 @@ def _load_persisted_settings():
     manager_hotkey_vk = _get_reg_int("ManagerHotkeyVk", DEFAULT_MANAGER_HOTKEY_VK)
     quick_type_hotkey_mods = _get_reg_int("QuickTypeHotkeyMods", DEFAULT_QUICK_TYPE_HOTKEY_MODS)
     quick_type_hotkey_vk = _get_reg_int("QuickTypeHotkeyVk", DEFAULT_QUICK_TYPE_HOTKEY_VK)
+    telemetry_enabled = _get_setting("TelemetryEnabled", False)  # opt-in, off unless the user turned it on before
+
+
+# ---------------------------------------------------------------------------
+# Telemetry implementation - report building, sanitization, local queueing,
+# sending, and best-effort MSIX install/update failure detection.
+#
+# Design: crash handlers only ever write a small JSON file to local disk
+# (fast, works even with no network) - actual sending happens separately, in
+# a background thread, so a slow/offline dashboard can never delay a crash
+# notification or hold up app startup.
+# ---------------------------------------------------------------------------
+_WIN_USER_PATH_RE = re.compile(r"([A-Za-z]:\\Users\\)[^\\]+", re.IGNORECASE)
+
+
+def _redact(text):
+    """Best-effort scrub of a Windows user-profile path (...\\Users\\<name>\\...)
+    out of exception text/tracebacks, as defense in depth - the traceback
+    itself is just file/line/source-line text (no local variable values),
+    but a file path can still embed a Windows username."""
+    if not text:
+        return text
+    try:
+        return _WIN_USER_PATH_RE.sub(lambda m: m.group(1) + "<user>", text)
+    except Exception:
+        return text
+
+
+def _get_device_id():
+    """A random, locally-generated ID used only to distinguish one install
+    from another on the dashboard (e.g. 'is this the same machine hitting
+    the same bug repeatedly'). Not derived from any hardware identifier,
+    account, or personal information."""
+    global _telemetry_device_id
+    if _telemetry_device_id:
+        return _telemetry_device_id
+    existing = _get_reg_str("TelemetryDeviceId")
+    if existing:
+        _telemetry_device_id = existing
+        return existing
+    new_id = str(uuid.uuid4())
+    _set_reg_str("TelemetryDeviceId", new_id)
+    _telemetry_device_id = new_id
+    return new_id
+
+
+def _get_app_version():
+    """The real Store package version for packaged installs (read straight
+    from the installed package, so it's always accurate); a hand-maintained
+    fallback constant for unpackaged/dev runs, which have no package to
+    read a version from."""
+    if _IS_PACKAGED_APP:
+        try:
+            from winsdk.windows.applicationmodel import Package
+
+            v = Package.current.id.version
+            return f"{v.major}.{v.minor}.{v.build}.{v.revision}"
+        except Exception:
+            pass
+    return APP_VERSION_FALLBACK
+
+
+def _build_crash_report(report_type, exc_type, exc_value, exc_tb, context=None):
+    details = _format_exc(exc_type, exc_value, exc_tb) if exc_tb is not None else None
+    return {
+        "report_type": report_type,  # "crash" | "install_failure"
+        "app_version": _get_app_version(),
+        "packaged": _IS_PACKAGED_APP,
+        "os_version": platform.platform(),
+        "device_id": _get_device_id(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "context": context,
+        "exception_type": exc_type.__name__ if exc_type else None,
+        "exception_message": _redact(str(exc_value)) if exc_value is not None else None,
+        "traceback": _redact(details),
+    }
+
+
+def _telemetry_queue_dir():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, "ClipboardTyper", "telemetry", "pending")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _queue_telemetry_report(report):
+    """Write one report to the local pending queue. Best-effort and never
+    raises - telemetry must never be the thing that causes (or masks) a
+    second crash on top of the one it's trying to report."""
+    if not telemetry_enabled:
+        return
+    try:
+        qdir = _telemetry_queue_dir()
+        existing = sorted(os.listdir(qdir))
+        if len(existing) >= TELEMETRY_MAX_QUEUE_FILES:
+            try:
+                os.remove(os.path.join(qdir, existing[0]))  # drop the oldest, keep the queue bounded
+            except OSError:
+                pass
+        filename = f"{time.time():.6f}_{uuid.uuid4().hex[:8]}.json"
+        with open(os.path.join(qdir, filename), "w", encoding="utf-8") as f:
+            json.dump(report, f)
+    except Exception:
+        pass
+
+
+def _send_telemetry_report(report):
+    payload = json.dumps(report).encode("utf-8")
+    req = urllib.request.Request(
+        TELEMETRY_ENDPOINT_URL,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-API-Key": TELEMETRY_API_KEY},
+    )
+    with urllib.request.urlopen(req, timeout=TELEMETRY_TIMEOUT_SECONDS) as resp:
+        return 200 <= resp.status < 300
+
+
+def _flush_telemetry_queue():
+    """Send any locally-queued reports (from this run, or an earlier one
+    that couldn't reach the network) to the dashboard. Always runs off the
+    main thread - a slow or unreachable server must never delay the tray
+    icon appearing or block a clipboard/typing action."""
+    if not telemetry_enabled:
+        return
+    try:
+        qdir = _telemetry_queue_dir()
+        cutoff = time.time() - TELEMETRY_MAX_QUEUE_AGE_DAYS * 86400
+        for filename in sorted(os.listdir(qdir)):
+            path = os.path.join(qdir, filename)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    report = json.load(f)
+                if _send_telemetry_report(report):
+                    os.remove(path)
+                # else: leave it queued, try again on the next flush
+            except (urllib.error.URLError, OSError, ValueError):
+                continue  # network hiccup or a malformed queued file - try again later
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _start_telemetry_flush():
+    threading.Thread(target=_flush_telemetry_queue, daemon=True, name="TelemetryFlush").start()
+
+
+def _check_install_deployment_failures():
+    """Best-effort: scan Windows' own AppX deployment event log for recent
+    install/update/repair failures tied to this app and queue them as
+    'install_failure' reports.
+
+    Real limit, by design, not a bug: a failed *first* install can never
+    self-report this way, since our code doesn't exist on the machine yet
+    to run at all in that case. This only helps for failures on a machine
+    where some version of the app has run at least once before (e.g. a
+    failed update, or a failed repair/reinstall) - see README for the full
+    explanation.
+    """
+    if not telemetry_enabled or not _IS_PACKAGED_APP:
+        return
+    try:
+        import win32evtlog
+    except Exception:
+        return
+
+    channel = "Microsoft-Windows-AppXDeploymentServer/Operational"
+    last_checked_str = _get_reg_str("TelemetryLastDeploymentCheck")
+    try:
+        last_checked = datetime.fromisoformat(last_checked_str) if last_checked_str else None
+    except ValueError:
+        last_checked = None
+
+    newest_seen = last_checked
+    query = None
+    try:
+        query = win32evtlog.EvtQuery(
+            channel, win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryReverseDirection
+        )
+        for _ in range(200):  # cap how far back a single pass ever looks
+            events = win32evtlog.EvtNext(query, 1)
+            if not events:
+                break
+            xml = win32evtlog.EvtRender(events[0], win32evtlog.EvtRenderEventXml)
+            if "Level=\"2\"" not in xml and "Level='2'" not in xml:
+                continue  # 2 = Error; skip Informational/Warning entries
+
+            time_match = re.search(r"TimeCreated SystemTime=['\"]([^'\"]+)['\"]", xml)
+            event_time = None
+            if time_match:
+                try:
+                    event_time = datetime.fromisoformat(time_match.group(1).replace("Z", "+00:00"))
+                except ValueError:
+                    event_time = None
+
+            if event_time and last_checked and event_time <= last_checked:
+                break  # reverse-chronological order - anything older was already reported
+            if event_time and (newest_seen is None or event_time > newest_seen):
+                newest_seen = event_time
+
+            _queue_telemetry_report({
+                "report_type": "install_failure",
+                "app_version": _get_app_version(),
+                "packaged": True,
+                "os_version": platform.platform(),
+                "device_id": _get_device_id(),
+                "timestamp_utc": (event_time or datetime.now(timezone.utc)).isoformat(),
+                "context": "appx_deployment_event_log",
+                "exception_type": None,
+                "exception_message": None,
+                "traceback": _redact(xml[:2000]),
+            })
+    except Exception:
+        pass
+    finally:
+        if query is not None:
+            try:
+                win32evtlog.EvtClose(query)
+            except Exception:
+                pass
+
+    if newest_seen:
+        _set_reg_str("TelemetryLastDeploymentCheck", newest_seen.isoformat())
+
+
+def _start_install_failure_check():
+    threading.Thread(
+        target=_check_install_deployment_failures, daemon=True, name="InstallFailureCheck"
+    ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1940,6 +2239,18 @@ def toggle_esc_cancels_typing(icon, item):
     _set_setting("EscCancelsTyping", esc_cancels_typing_enabled)
 
 
+def toggle_telemetry(icon, item):
+    global telemetry_enabled
+    telemetry_enabled = not telemetry_enabled
+    _set_setting("TelemetryEnabled", telemetry_enabled)
+    if telemetry_enabled:
+        # Send anything already queued (unlikely right after enabling, but
+        # harmless) and take one pass over the deployment event log right
+        # away, rather than waiting for the next app restart.
+        _start_telemetry_flush()
+        _start_install_failure_check()
+
+
 def quit_app(icon, item):
     icon.stop()
     _release_instance_mutex()
@@ -1987,6 +2298,11 @@ def _build_tray_menu_items():
             "Cancel typing by pressing Esc",
             toggle_esc_cancels_typing,
             checked=lambda item: esc_cancels_typing_enabled,
+        ),
+        pystray.MenuItem(
+            "Send crash & diagnostic reports",
+            toggle_telemetry,
+            checked=lambda item: telemetry_enabled,
         ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(
@@ -2051,6 +2367,10 @@ def main():
     threading.Timer(CRASH_RESTART_RESET_AFTER_SECONDS, _mark_crash_restart_recovered).start()
 
     _enable_dpi_awareness()
+
+    if telemetry_enabled:
+        _start_telemetry_flush()
+        _start_install_failure_check()
 
     threading.Thread(target=monitor_clipboard, daemon=True, name="ClipboardMonitor").start()
 

@@ -229,6 +229,47 @@ box telling you what happened:
 Either way, the message box includes the underlying error so it can be
 reported/debugged.
 
+## Diagnostics / telemetry (opt-in)
+
+Partner Center's own crash insights don't include a traceback or enough
+detail to actually debug from. As an alternative, the tray menu has a
+**"Send crash & diagnostic reports"** toggle — **off by default**. When a
+user turns it on:
+
+- Any crash (background task or whole-app) is queued locally as a small
+  JSON file and sent to a dashboard endpoint you host yourself, in the
+  background, without blocking the crash notification or app startup.
+- On each launch, the app also does a best-effort scan of Windows' own
+  AppX deployment event log for recent install/update/repair failures and
+  reports those the same way. **Real limitation:** a failed *first*
+  install can never self-report this way — the app's code doesn't exist
+  on the machine yet to run at all in that case. This only catches
+  failures on a machine where some version of the app has run before
+  (e.g. a failed update).
+- **Clipboard content is never included.** Only error metadata: exception
+  type/message, a traceback, app version, OS version, and a random
+  per-install ID generated locally (not derived from any hardware
+  identifier). See `_redact()` in `clipboard_typer.py` for the scrubbing
+  applied to strip Windows usernames out of file paths in tracebacks, as
+  defense in depth.
+- The setting is stored under the same registry key as the app's other
+  settings (`HKCU\Software\ClipboardTyper\TelemetryEnabled`) and, once
+  turned on, stays on across restarts until turned off again.
+
+**Before shipping a build with this turned on for real users**, set
+`TELEMETRY_ENDPOINT_URL` and `TELEMETRY_API_KEY` near the top of
+`clipboard_typer.py`. `TELEMETRY_API_KEY` should be a *write-only* ingest
+key (can create reports, can't read any back) — since it ships inside a
+distributed EXE, anyone who unpacks the build can see it, so treat it as
+an abuse-prevention token, not a real secret. A working starting point
+for the server side (ingest endpoint + SQLite storage + a basic
+employee-only dashboard) is in `backend_reference/telemetry_backend.py` —
+read the module docstring there for how to adapt it to your actual
+website's framework and login system. You'll also want a line in your
+privacy policy / Store listing disclosing this opt-in reporting, since
+undisclosed telemetry — even opt-in — is worth being upfront about for
+both users and any future Store re-certification.
+
 ## Using it across a Remote Desktop / Windows App session
 
 Typing now works when the target text box is inside a remote session

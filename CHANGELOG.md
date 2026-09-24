@@ -5,6 +5,21 @@ All notable changes to Clipboard Typer are recorded here, one entry per
 see the note at the bottom for where the *user*-facing "what's new" text
 for each release lives.
 
+## 1.4.0.0
+
+### Added
+- **Opt-in crash & diagnostic reporting** — a new "Send crash & diagnostic
+  reports" tray menu toggle (off by default) sends crash reports to a
+  self-hosted dashboard, since Partner Center's own crash insights lack a
+  traceback and enough detail to debug from. Also does a best-effort scan
+  of Windows' AppX deployment event log on each launch to catch
+  install/update failures on machines where the app has run before (a
+  failed *first* install can't self-report — the app isn't there yet to
+  run). Never includes clipboard content — only exception details, app/OS
+  version, and a random locally-generated install ID. A reference server
+  implementation (Flask ingest endpoint + SQLite + employee dashboard) is
+  included in `backend_reference/telemetry_backend.py`.
+
 ## 1.3.0.0
 
 ### Fixed

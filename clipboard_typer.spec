@@ -36,6 +36,7 @@ a = Analysis(
         'win32api',
         'win32event',
         'winerror',
+        'win32evtlog',  # used by the opt-in telemetry's best-effort install-failure check
     ] + winsdk_hiddenimports,
     hookspath=[],
     hooksconfig={},
